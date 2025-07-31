@@ -271,4 +271,253 @@ get_recent_metrics() {
         --period 3600 \
         --statistics Sum \
         --query 'Datapoints[0].Sum' \
-        --output text 2>/dev/null || echo "N
+        --output text 2>/dev/null || echo "No data")
+
+    print_status "Total requests (24h): $requests"
+
+    # Get bytes downloaded
+    local bytes=$(aws cloudwatch get-metric-statistics \
+        --namespace AWS/CloudFront \
+        --metric-name BytesDownloaded \
+        --dimensions Name=DistributionId,Value="$DISTRIBUTION_ID" \
+        --start-time "$start_time" \
+        --end-time "$end_time" \
+        --period 3600 \
+        --statistics Sum \
+        --query 'Datapoints[0].Sum' \
+        --output text 2>/dev/null || echo "No data")
+
+    if [ "$bytes" != "No data" ] && [ "$bytes" != "None" ]; then
+        local bytes_mb=$(echo "scale=2; $bytes / 1024 / 1024" | bc 2>/dev/null || echo "$bytes")
+        print_status "Data transferred (24h): ${bytes_mb} MB"
+    else
+        print_status "Data transferred (24h): No data"
+    fi
+
+    # Get error rates
+    local error_4xx=$(aws cloudwatch get-metric-statistics \
+        --namespace AWS/CloudFront \
+        --metric-name 4xxErrorRate \
+        --dimensions Name=DistributionId,Value="$DISTRIBUTION_ID" \
+        --start-time "$start_time" \
+        --end-time "$end_time" \
+        --period 3600 \
+        --statistics Average \
+        --query 'Datapoints[0].Average' \
+        --output text 2>/dev/null || echo "No data")
+
+    local error_5xx=$(aws cloudwatch get-metric-statistics \
+        --namespace AWS/CloudFront \
+        --metric-name 5xxErrorRate \
+        --dimensions Name=DistributionId,Value="$DISTRIBUTION_ID" \
+        --start-time "$start_time" \
+        --end-time "$end_time" \
+        --period 3600 \
+        --statistics Average \
+        --query 'Datapoints[0].Average' \
+        --output text 2>/dev/null || echo "No data")
+
+    print_status "4xx error rate (24h): $error_4xx%"
+    print_status "5xx error rate (24h): $error_5xx%"
+}
+
+# Function to check log files
+check_logs() {
+    print_header "LOG FILES STATUS"
+
+    local logs_bucket=$(terraform output -raw logs_bucket_name 2>/dev/null || echo "")
+
+    if [ -n "$logs_bucket" ]; then
+        print_status "Checking CloudFront access logs in $logs_bucket"
+
+        # Check if logs exist
+        local log_count=$(aws s3 ls "s3://$logs_bucket/cloudfront-logs/" --recursive | wc -l)
+        print_status "CloudFront log files: $log_count"
+
+        if [ "$log_count" -gt 0 ]; then
+            # Get most recent log file
+            local recent_log=$(aws s3 ls "s3://$logs_bucket/cloudfront-logs/" --recursive | sort | tail -1 | awk '{print $4}')
+            print_status "Most recent log: $recent_log"
+        fi
+
+        # Check WAF logs
+        print_status "Checking WAF logs..."
+        local waf_log_groups=$(aws logs describe-log-groups --log-group-name-prefix "aws-waf-logs" --query 'logGroups[].logGroupName' --output text 2>/dev/null || echo "")
+
+        if [ -n "$waf_log_groups" ]; then
+            print_success "WAF logging is configured"
+            echo "  Log groups: $waf_log_groups"
+        else
+            print_warning "WAF logging not found or not configured"
+        fi
+    else
+        print_warning "Logs bucket not found"
+    fi
+}
+
+# Function to perform security checks
+security_checks() {
+    print_header "SECURITY CHECKS"
+
+    local url="https://$DOMAIN_NAME"
+
+    # Check security headers
+    print_status "Checking security headers..."
+    local headers=$(curl -sI "$url" --max-time 10 2>/dev/null || echo "")
+
+    if [ -n "$headers" ]; then
+        # Check for important security headers
+        if echo "$headers" | grep -qi "strict-transport-security"; then
+            print_success "HSTS header present"
+        else
+            print_warning "HSTS header missing"
+        fi
+
+        if echo "$headers" | grep -qi "x-frame-options"; then
+            print_success "X-Frame-Options header present"
+        else
+            print_warning "X-Frame-Options header missing"
+        fi
+
+        if echo "$headers" | grep -qi "x-content-type-options"; then
+            print_success "X-Content-Type-Options header present"
+        else
+            print_warning "X-Content-Type-Options header missing"
+        fi
+
+        if echo "$headers" | grep -qi "referrer-policy"; then
+            print_success "Referrer-Policy header present"
+        else
+            print_warning "Referrer-Policy header missing"
+        fi
+    else
+        print_error "Could not retrieve headers for security check"
+    fi
+
+    # Test HTTP to HTTPS redirect
+    print_status "Testing HTTP to HTTPS redirect..."
+    local redirect_code=$(curl -s -o /dev/null -w "%{http_code}" --max-time 10 "http://$DOMAIN_NAME" 2>/dev/null || echo "000")
+
+    if [ "$redirect_code" == "301" ] || [ "$redirect_code" == "302" ]; then
+        print_success "HTTP to HTTPS redirect working (HTTP $redirect_code)"
+    else
+        print_warning "HTTP to HTTPS redirect may not be working (HTTP $redirect_code)"
+    fi
+}
+
+# Function to generate summary report
+generate_summary() {
+    print_header "MONITORING SUMMARY"
+
+    echo "Infrastructure Status Report"
+    echo "Generated at: $(date)"
+    echo ""
+    echo "Infrastructure Details:"
+    echo "  CloudFront Distribution: $DISTRIBUTION_ID"
+    echo "  Domain: $DOMAIN_NAME"
+    echo "  S3 Bucket: $S3_BUCKET"
+    echo ""
+
+    # Quick health check
+    local health_score=0
+    local total_checks=5
+
+    # Check if website is accessible
+    if curl -s --max-time 10 "https://$DOMAIN_NAME" >/dev/null 2>&1; then
+        health_score=$((health_score + 1))
+    fi
+
+    # Check CloudFront status
+    if [ "$(aws cloudfront get-distribution --id "$DISTRIBUTION_ID" --query 'Distribution.Status' --output text 2>/dev/null)" == "Deployed" ]; then
+        health_score=$((health_score + 1))
+    fi
+
+    # Check S3 bucket access
+    if aws s3 ls "s3://$S3_BUCKET" >/dev/null 2>&1; then
+        health_score=$((health_score + 1))
+    fi
+
+    # Check for any alarms
+    local alarm_count=$(aws cloudwatch describe-alarms --alarm-name-prefix "$(terraform output -raw project_name 2>/dev/null)" --state-value ALARM --query 'length(MetricAlarms)' --output text 2>/dev/null || echo "0")
+    if [ "$alarm_count" == "0" ]; then
+        health_score=$((health_score + 1))
+    fi
+
+    # Check SSL certificate
+    if echo | openssl s_client -servername "$DOMAIN_NAME" -connect "$DOMAIN_NAME:443" 2>/dev/null | openssl x509 -noout -checkend 86400 >/dev/null 2>&1; then
+        health_score=$((health_score + 1))
+    fi
+
+    local health_percentage=$((health_score * 100 / total_checks))
+
+    echo "Overall Health Score: $health_score/$total_checks ($health_percentage%)"
+
+    if [ $health_percentage -ge 80 ]; then
+        print_success "Infrastructure is healthy"
+    elif [ $health_percentage -ge 60 ]; then
+        print_warning "Infrastructure has some issues"
+    else
+        print_error "Infrastructure needs attention"
+    fi
+}
+
+# Main execution
+main() {
+    echo -e "${PURPLE}"
+    echo "╔════════════════════════════════════════════════════════════════╗"
+    echo "║                   INFRASTRUCTURE MONITOR                       ║"
+    echo "║                Production Website Health Check                 ║"
+    echo "╚════════════════════════════════════════════════════════════════╝"
+    echo -e "${NC}"
+
+    check_prerequisites
+    get_terraform_outputs
+    check_cloudfront
+    test_website_access
+    check_s3_bucket
+    check_waf
+    check_cloudwatch_alarms
+    get_recent_metrics
+    check_logs
+    security_checks
+    generate_summary
+
+    echo -e "\n${GREEN}Monitoring check completed!${NC}"
+    echo "For detailed metrics, visit the CloudWatch dashboard:"
+    terraform output -raw dashboard_url 2>/dev/null || echo "Dashboard URL not available"
+}
+
+# Handle script arguments
+case "${1:-}" in
+    --help|-h)
+        echo "Infrastructure Monitoring Script"
+        echo ""
+        echo "Usage: $0 [options]"
+        echo ""
+        echo "Options:"
+        echo "  --help, -h     Show this help message"
+        echo "  --quick, -q    Run quick health check only"
+        echo "  --logs, -l     Check logs only"
+        echo "  --security, -s Security checks only"
+        echo ""
+        exit 0
+        ;;
+    --quick|-q)
+        check_prerequisites
+        get_terraform_outputs
+        test_website_access
+        ;;
+    --logs|-l)
+        check_prerequisites
+        get_terraform_outputs
+        check_logs
+        ;;
+    --security|-s)
+        check_prerequisites
+        get_terraform_outputs
+        security_checks
+        ;;
+    *)
+        main
+        ;;
+esac
