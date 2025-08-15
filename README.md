@@ -1,4 +1,13 @@
 # terraform-s3-secure
+<p align="left">
+  <img src="https://img.shields.io/badge/Terraform-7B42BC?style=for-the-badge&logo=terraform&logoColor=white" />
+  <img src="https://img.shields.io/badge/Amazon%20S3-569A31?style=for-the-badge&logo=amazon-s3&logoColor=white" />
+  <img src="https://img.shields.io/badge/Amazon%20CloudFront-FF9900?style=for-the-badge&logo=amazon-aws&logoColor=white" />
+  <img src="https://img.shields.io/badge/AWS%20Certificate%20Manager-232F3E?style=for-the-badge&logo=amazon-aws&logoColor=white" />
+  <img src="https://img.shields.io/badge/Amazon%20Route%2053-8C4FFF?style=for-the-badge&logo=amazon-aws&logoColor=white" />
+  <img src="https://img.shields.io/badge/GitHub%20Actions-2088FF?style=for-the-badge&logo=github-actions&logoColor=white" />
+</p>
+
 ## Secure Static Website Infrastructure on AWS
 This Terraform project automates the deployment of a static website on AWS using industry best practices. It integrates S3 for storage, CloudFront for global content delivery, and AWS WAF with advanced threat protection to defend against OWASP Top 10 vulnerabilities. Designed for zero-downtime deployments, the infrastructure includes automated CI/CD, real-time monitoring, and cost-optimized scaling—all managed as code.
 
