@@ -205,7 +205,8 @@ output "monitoring_urls" {
     cloudfront_console   = "https://console.aws.amazon.com/cloudfront/v3/home#/distributions/${aws_cloudfront_distribution.website.id}"
     waf_console          = "https://${data.aws_region.current.name}.console.aws.amazon.com/wafv2/homev2/web-acl/${aws_wafv2_web_acl.website.name}/${aws_wafv2_web_acl.website.id}/overview?region=global"
     s3_console           = "https://s3.console.aws.amazon.com/s3/buckets/${aws_s3_bucket.website.bucket}"
-    acm_console          = "https://${data.aws_region.current.name}.console.aws.amazon.com/acm/home?region=${data.aws_region.current.name}#/certificates/${replace(aws_acm_certificate.website.arn, "arn:aws:acm:${data.aws_region.current.name}:${data.aws_caller_identity.current.account_id}:certificate/", "")}"
+    # COMMENTED OUT:
+    # acm_console          = "https://${data.aws_region.current.name}.console.aws.amazon.com/acm/home?region=${data.aws_region.current.name}#/certificates/${replace(aws_acm_certificate.website.arn, "arn:aws:acm:${data.aws_region.current.name}:${data.aws_caller_identity.current.account_id}:certificate/", "")}"
   }
 }
 
@@ -213,6 +214,7 @@ output "monitoring_urls" {
 output "next_steps" {
   description = "Post-deployment steps to complete setup"
   value = [
+    "0, Your website is accessible at: https://${aws_cloudfront_distribution.website.domain_name}",
     "1. Configure DNS records using the dns_configuration_help output",
     "2. Validate SSL certificate through DNS or email validation",
     "3. Upload your website files to S3 bucket: ${aws_s3_bucket.website.bucket}",
