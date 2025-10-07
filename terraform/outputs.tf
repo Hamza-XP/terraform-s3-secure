@@ -102,10 +102,16 @@ output "high_5xx_alarm_arn" {
   value       = aws_cloudwatch_metric_alarm.high_5xx_error_rate.arn
 }
 
+# COMMENTED OUT:
 # Configuration Values
+# output "website_url" {
+#   description = "Main website URL"
+#   value       = "https://${var.domain_name}"
+# }
+# CHANGED TO:
 output "website_url" {
   description = "Main website URL"
-  value       = "https://${var.domain_name}"
+  value       = "https://${aws_cloudfront_distribution.website.domain_name}"
 }
 
 output "www_website_url" {
