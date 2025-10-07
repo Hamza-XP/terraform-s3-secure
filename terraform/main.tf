@@ -348,6 +348,8 @@ resource "aws_wafv2_web_acl_logging_configuration" "website" {
 # SSL CERTIFICATE (ACM)
 # ============================================================================
 
+# COMMENTED OUT:
+/*
 resource "aws_acm_certificate" "website" {
   domain_name               = var.domain_name
   subject_alternative_names = ["*.${var.domain_name}"]
@@ -362,6 +364,7 @@ resource "aws_acm_certificate" "website" {
     Environment = var.environment
   }
 }
+*/
 
 # ============================================================================
 # CLOUDFRONT ORIGIN ACCESS CONTROL
