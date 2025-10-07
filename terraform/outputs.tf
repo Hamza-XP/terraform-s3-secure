@@ -130,7 +130,9 @@ output "project_info" {
   value = {
     project_name      = var.project_name
     environment       = var.environment
-    domain_name       = var.domain_name
+    # domain_name       = var.domain_name
+    # CHANGED:
+    domain_name = var.use_custom_domain ? var.domain_name : "Using CloudFront domain"
     allowed_countries = var.allowed_countries
     aws_region        = data.aws_region.current.name
     account_id        = data.aws_caller_identity.current.account_id
