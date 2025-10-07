@@ -137,26 +137,32 @@ output "project_info" {
   }
 }
 
-# DNS Configuration Help
+# COMMENTED OUT: Full DNS configuration object
+# # DNS Configuration Help
+# output "dns_configuration_help" {
+#   description = "DNS records that need to be configured"
+#   value = {
+#     root_domain = {
+#       type   = "A"
+#       name   = var.domain_name
+#       value  = "ALIAS to ${aws_cloudfront_distribution.website.domain_name}"
+#       note   = "Use ALIAS record for root domain (Route 53) or A record with CloudFront IP"
+#     }
+#     www_subdomain = {
+#       type  = "CNAME"
+#       name  = "www.${var.domain_name}"
+#       value = aws_cloudfront_distribution.website.domain_name
+#       note  = "Standard CNAME record pointing to CloudFront"
+#     }
+#     ssl_validation = {
+#       note = "Check domain_validation_options output for SSL certificate validation records"
+#     }
+#   }
+# }
+# CHANGED TO:
 output "dns_configuration_help" {
-  description = "DNS records that need to be configured"
-  value = {
-    root_domain = {
-      type   = "A"
-      name   = var.domain_name
-      value  = "ALIAS to ${aws_cloudfront_distribution.website.domain_name}"
-      note   = "Use ALIAS record for root domain (Route 53) or A record with CloudFront IP"
-    }
-    www_subdomain = {
-      type  = "CNAME"
-      name  = "www.${var.domain_name}"
-      value = aws_cloudfront_distribution.website.domain_name
-      note  = "Standard CNAME record pointing to CloudFront"
-    }
-    ssl_validation = {
-      note = "Check domain_validation_options output for SSL certificate validation records"
-    }
-  }
+  description = "DNS records that need to be configured (only applicable if using custom domain)"
+  value       = "No DNS configuration needed - using CloudFront URL"
 }
 
 # Security Configuration Summary
