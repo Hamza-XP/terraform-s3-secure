@@ -522,8 +522,9 @@ resource "aws_cloudfront_distribution" "website" {
     bucket          = aws_s3_bucket.logs.bucket_domain_name
     prefix          = "cloudfront-logs/"
   }
-
-  aliases = [var.domain_name, "www.${var.domain_name}"]
+  
+  # COMMENTED OUT: Uncomment aliases below if using custom domain
+  #aliases = [var.domain_name, "www.${var.domain_name}"]
 
   default_cache_behavior {
     allowed_methods  = ["DELETE", "GET", "HEAD", "OPTIONS", "PATCH", "POST", "PUT"]
