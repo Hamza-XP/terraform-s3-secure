@@ -17,10 +17,24 @@ terraform {
 # VARIABLES
 # ============================================================================
 
+#variable "domain_name" {
+#  description = "The domain name for the website"
+#  type        = string
+#  default     = "example.com"
+#}
+
+# MODIFIED:
 variable "domain_name" {
-  description = "The domain name for the website"
+  description = "The domain name for the website (optional - leave empty to use CloudFront domain)"
   type        = string
-  default     = "example.com"
+  default     = ""
+}
+
+# ADDED:
+variable "use_custom_domain" {
+  description = "Set to true if using a custom domain, false to use CloudFront domain only"
+  type        = bool
+  default     = false
 }
 
 variable "environment" {
