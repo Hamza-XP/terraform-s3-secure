@@ -45,9 +45,17 @@ output "waf_web_acl_arn" {
   value       = aws_wafv2_web_acl.website.arn
 }
 
+# COMMENTED OUT domain validation options output
+/*
 output "ssl_certificate_arn" {
   description = "ARN of the SSL certificate"
   value       = aws_acm_certificate.website.arn
+}
+*/
+# CHANGED TO:
+output "ssl_certificate_arn" {
+  description = "ARN of the SSL certificate (only if using custom domain)"
+  value       = "Using CloudFront default certificate"
 }
 
 output "ssl_certificate_domain_validation_options" {
