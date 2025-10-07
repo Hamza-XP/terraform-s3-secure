@@ -522,7 +522,7 @@ resource "aws_cloudfront_distribution" "website" {
     bucket          = aws_s3_bucket.logs.bucket_domain_name
     prefix          = "cloudfront-logs/"
   }
-  
+
   # COMMENTED OUT: Uncomment aliases below if using custom domain
   #aliases = [var.domain_name, "www.${var.domain_name}"]
 
@@ -577,9 +577,16 @@ resource "aws_cloudfront_distribution" "website" {
     }
   }
 
+  /*
   viewer_certificate {
     acm_certificate_arn = aws_acm_certificate.website.arn
     ssl_support_method  = "sni-only"
+  }
+  */
+
+  # CHANGED TO:
+  viewer_certificate {
+    cloudfront_default_certificate = true
   }
 
   web_acl_id = aws_wafv2_web_acl.website.arn
