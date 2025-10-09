@@ -1,10 +1,13 @@
 # ============================================================================
 # TERRAFORM VARIABLES CONFIGURATION
-# Copy this file to terraform.tfvars and customize the values
 # ============================================================================
 
 # Domain configuration
-domain_name = "yourdomain.com"
+use_custom_domain = false
+domain_name       = ""
+# If you want to use your own domain later, change to:
+# use_custom_domain = true
+# domain_name = "yourdomain.com"
 
 # Environment settings
 environment  = "production"
@@ -12,16 +15,7 @@ project_name = "secure-website"
 
 # Security settings - Countries allowed to access the website
 # Use ISO 3166-1 alpha-2 country codes
-allowed_countries = [
-  "US", # United States
-  "CA", # Canada
-  "GB", # United Kingdom
-  "DE", # Germany
-  "FR", # France
-  "AU", # Australia
-  "JP", # Japan
-  "SG", # Singapore
-]
+allowed_countries = []
 
 # Example for different environments:
 # For staging:
