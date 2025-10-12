@@ -39,10 +39,6 @@ env:
   TF_IN_AUTOMATION: true
   TF_INPUT: false
 
-permissions:
-  contents: read
-  security-events: write
-
 jobs:
   validate:
     name: 🔍 Validate Terraform
@@ -134,13 +130,12 @@ jobs:
         with:
           sarif_file: checkov-results.sarif
 
-      - name: 🧩 Install TFSec
-        run: |
-          curl -s https://raw.githubusercontent.com/aquasecurity/tfsec/master/scripts/install_linux.sh | bash
-
       - name: 🔍 Run TFSec
-        run: |
-          tfsec --format sarif --out tfsec-results.sarif .
+        uses: aquasecurity/tfsec-action@v1.0.3
+        with:
+          working_directory: .
+          format: sarif
+          sarif_file: tfsec-results.sarif
         continue-on-error: true
 
       - name: 📊 Upload TFSec Results
