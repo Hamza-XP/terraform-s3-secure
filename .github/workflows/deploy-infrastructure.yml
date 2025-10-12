@@ -135,11 +135,8 @@ jobs:
           sarif_file: checkov-results.sarif
 
       - name: 🔍 Run TFSec
-        uses: aquasecurity/tfsec-action@v1.0.3
-        with:
-          working_directory: .
-          format: sarif
-          sarif_file: tfsec-results.sarif
+        run: |
+          tfsec --format sarif --out tfsec-results.sarif .
         continue-on-error: true
 
       - name: 📊 Upload TFSec Results
