@@ -39,6 +39,10 @@ env:
   TF_IN_AUTOMATION: true
   TF_INPUT: false
 
+permissions:
+  contents: read
+  security-events: write
+
 jobs:
   validate:
     name: 🔍 Validate Terraform
