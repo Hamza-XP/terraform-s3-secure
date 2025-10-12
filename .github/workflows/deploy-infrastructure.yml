@@ -1,0 +1,447 @@
+name: 🚀 Deploy Infrastructure
+
+on:
+  push:
+    branches: [main, production]
+    paths:
+      - '**.tf'
+      - '**.tfvars'
+      - '.github/workflows/deploy-infrastructure.yml'
+  pull_request:
+    branches: [main, production]
+    paths:
+      - '**.tf'
+      - '**.tfvars'
+  workflow_dispatch:
+    inputs:
+      action:
+        description: 'Action to perform'
+        required: true
+        default: 'plan'
+        type: choice
+        options:
+          - plan
+          - apply
+          - destroy
+      environment:
+        description: 'Environment to deploy'
+        required: true
+        default: 'production'
+        type: choice
+        options:
+          - production
+          - staging
+          - development
+
+env:
+  TF_VERSION: '1.5.0'
+  AWS_REGION: 'us-east-1'
+  TF_IN_AUTOMATION: true
+  TF_INPUT: false
+
+jobs:
+  validate:
+    name: 🔍 Validate Terraform
+    runs-on: ubuntu-latest
+    outputs:
+      tf-fmt: ${{ steps.fmt.outcome }}
+      tf-validate: ${{ steps.validate.outcome }}
+    
+    steps:
+      - name: 📥 Checkout Code
+        uses: actions/checkout@v4
+
+      - name: 🔧 Setup Terraform
+        uses: hashicorp/setup-terraform@v3
+        with:
+          terraform_version: ${{ env.TF_VERSION }}
+
+      - name: 🎨 Terraform Format Check
+        id: fmt
+        run: terraform fmt -check -recursive
+        continue-on-error: true
+
+      - name: 🔧 Terraform Init
+        run: terraform init -backend=false
+
+      - name: ✅ Terraform Validate
+        id: validate
+        run: terraform validate
+
+      - name: 📊 Comment PR - Validation Results
+        if: github.event_name == 'pull_request'
+        uses: actions/github-script@v7
+        with:
+          script: |
+            const output = `
+            ## 🔍 Terraform Validation Results
+            
+            | Check | Result |
+            |-------|--------|
+            | Format | ${{ steps.fmt.outcome == 'success' && '✅ Passed' || '❌ Failed - Run `terraform fmt -recursive`' }} |
+            | Validate | ${{ steps.validate.outcome == 'success' && '✅ Passed' || '❌ Failed' }} |
+            
+            <details><summary>Show Details</summary>
+            
+            ### Terraform Format
+            \`\`\`
+            ${{ steps.fmt.outputs.stdout }}
+            ${{ steps.fmt.outputs.stderr }}
+            \`\`\`
+            
+            ### Terraform Validate
+            \`\`\`
+            ${{ steps.validate.outputs.stdout }}
+            ${{ steps.validate.outputs.stderr }}
+            \`\`\`
+            
+            </details>
+            `;
+            
+            github.rest.issues.createComment({
+              issue_number: context.issue.number,
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              body: output
+            });
+
+  security-scan:
+    name: 🔒 Security Scan
+    runs-on: ubuntu-latest
+    needs: validate
+    
+    steps:
+      - name: 📥 Checkout Code
+        uses: actions/checkout@v4
+
+      - name: 🔍 Run Checkov
+        uses: bridgecrewio/checkov-action@master
+        with:
+          directory: .
+          framework: terraform
+          output_format: sarif
+          output_file_path: checkov-results.sarif
+          download_external_modules: true
+        continue-on-error: true
+
+      - name: 📊 Upload Checkov Results
+        if: always()
+        uses: github/codeql-action/upload-sarif@v3
+        with:
+          sarif_file: checkov-results.sarif
+
+      - name: 🔍 Run TFSec
+        uses: aquasecurity/tfsec-action@v1.0.3
+        with:
+          working_directory: .
+          format: sarif
+          sarif_file: tfsec-results.sarif
+        continue-on-error: true
+
+      - name: 📊 Upload TFSec Results
+        if: always()
+        uses: github/codeql-action/upload-sarif@v3
+        with:
+          sarif_file: tfsec-results.sarif
+
+  plan:
+    name: 📋 Terraform Plan
+    runs-on: ubuntu-latest
+    needs: [validate, security-scan]
+    if: github.event_name == 'pull_request' || github.event_name == 'workflow_dispatch'
+    environment: 
+      name: ${{ github.event.inputs.environment || 'production' }}
+    
+    outputs:
+      tf-plan-exitcode: ${{ steps.plan.outputs.exitcode }}
+    
+    steps:
+      - name: 📥 Checkout Code
+        uses: actions/checkout@v4
+
+      - name: 🔧 Setup Terraform
+        uses: hashicorp/setup-terraform@v3
+        with:
+          terraform_version: ${{ env.TF_VERSION }}
+
+      - name: 🔐 Configure AWS Credentials
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          aws-access-key-id: ${{ secrets.AWS_ACCESS_KEY_ID }}
+          aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+          aws-region: ${{ env.AWS_REGION }}
+
+      - name: 🔧 Terraform Init
+        run: terraform init
+
+      - name: 📋 Terraform Plan
+        id: plan
+        run: |
+          terraform plan -detailed-exitcode -no-color -out=tfplan
+          echo "exitcode=$?" >> $GITHUB_OUTPUT
+        continue-on-error: true
+
+      - name: 📊 Comment PR - Plan Results
+        if: github.event_name == 'pull_request'
+        uses: actions/github-script@v7
+        with:
+          script: |
+            const fs = require('fs');
+            
+            // Read terraform plan output
+            let planOutput = '';
+            try {
+              planOutput = require('child_process').execSync('terraform show -no-color tfplan', {encoding: 'utf8'});
+            } catch (error) {
+              planOutput = 'Error reading plan output';
+            }
+            
+            const maxLength = 65000; // GitHub comment limit
+            if (planOutput.length > maxLength) {
+              planOutput = planOutput.substring(0, maxLength) + '\n\n... (truncated)';
+            }
+            
+            const exitCode = '${{ steps.plan.outputs.exitcode }}';
+            let planResult = '';
+            
+            if (exitCode === '0') {
+              planResult = '✅ No changes detected';
+            } else if (exitCode === '2') {
+              planResult = '📝 Changes detected';
+            } else {
+              planResult = '❌ Plan failed';
+            }
+            
+            const output = `
+            ## 📋 Terraform Plan Results
+            
+            **Result:** ${planResult}
+            **Exit Code:** ${exitCode}
+            
+            <details><summary>Show Plan Output</summary>
+            
+            \`\`\`hcl
+            ${planOutput}
+            \`\`\`
+            
+            </details>
+            
+            **Next Steps:**
+            ${exitCode === '2' ? '- Review the changes above\n- Merge this PR to apply changes' : ''}
+            ${exitCode === '1' ? '- Fix the plan errors before merging' : ''}
+            `;
+            
+            github.rest.issues.createComment({
+              issue_number: context.issue.number,
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              body: output
+            });
+
+      - name: 💾 Upload Plan Artifact
+        if: steps.plan.outputs.exitcode == '2'
+        uses: actions/upload-artifact@v4
+        with:
+          name: terraform-plan
+          path: tfplan
+          retention-days: 5
+
+  apply:
+    name: 🚀 Terraform Apply
+    runs-on: ubuntu-latest
+    needs: [validate, security-scan]
+    if: |
+      (github.ref == 'refs/heads/main' && github.event_name == 'push') ||
+      (github.event_name == 'workflow_dispatch' && github.event.inputs.action == 'apply')
+    environment: 
+      name: ${{ github.event.inputs.environment || 'production' }}
+      url: ${{ steps.outputs.outputs.website_url }}
+    
+    steps:
+      - name: 📥 Checkout Code
+        uses: actions/checkout@v4
+
+      - name: 🔧 Setup Terraform
+        uses: hashicorp/setup-terraform@v3
+        with:
+          terraform_version: ${{ env.TF_VERSION }}
+
+      - name: 🔐 Configure AWS Credentials
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          aws-access-key-id: ${{ secrets.AWS_ACCESS_KEY_ID }}
+          aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+          aws-region: ${{ env.AWS_REGION }}
+
+      - name: 🔧 Terraform Init
+        run: terraform init
+
+      - name: 📋 Terraform Plan
+        run: terraform plan -out=tfplan
+
+      - name: 🚀 Terraform Apply
+        run: terraform apply -auto-approve tfplan
+
+      - name: 📤 Get Terraform Outputs
+        id: outputs
+        run: |
+          echo "website_url=$(terraform output -raw website_url)" >> $GITHUB_OUTPUT
+          echo "cloudfront_domain=$(terraform output -raw cloudfront_domain_name)" >> $GITHUB_OUTPUT
+          echo "s3_bucket=$(terraform output -raw s3_bucket_name)" >> $GITHUB_OUTPUT
+          echo "distribution_id=$(terraform output -raw cloudfront_distribution_id)" >> $GITHUB_OUTPUT
+
+      - name: 📁 Upload Website Files
+        run: |
+          # Upload HTML files
+          find . -name "*.html" -exec aws s3 cp {} s3://${{ steps.outputs.outputs.s3_bucket }}/ --content-type "text/html" \;
+          
+          # Upload image files
+          find . -name "*.png" -exec aws s3 cp {} s3://${{ steps.outputs.outputs.s3_bucket }}/ --content-type "image/png" \;
+          find . -name "*.jpg" -exec aws s3 cp {} s3://${{ steps.outputs.outputs.s3_bucket }}/ --content-type "image/jpeg" \;
+          find . -name "*.gif" -exec aws s3 cp {} s3://${{ steps.outputs.outputs.s3_bucket }}/ --content-type "image/gif" \;
+          
+          # Upload CSS files
+          find . -name "*.css" -exec aws s3 cp {} s3://${{ steps.outputs.outputs.s3_bucket }}/ --content-type "text/css" \;
+          
+          # Upload JS files  
+          find . -name "*.js" -exec aws s3 cp {} s3://${{ steps.outputs.outputs.s3_bucket }}/ --content-type "application/javascript" \;
+
+      - name: 🔄 Invalidate CloudFront Cache
+        run: |
+          aws cloudfront create-invalidation \
+            --distribution-id ${{ steps.outputs.outputs.distribution_id }} \
+            --paths "/*"
+
+      - name: 🧪 Run Health Checks
+        run: |
+          # Wait for deployment to propagate
+          sleep 30
+          
+          # Test website accessibility
+          url="https://${{ steps.outputs.outputs.cloudfront_domain }}"
+          echo "Testing website accessibility: $url"
+          
+          response=$(curl -s -o /dev/null -w "%{http_code}" --max-time 30 "$url")
+          
+          if [ "$response" = "200" ]; then
+            echo "✅ Website is accessible (HTTP $response)"
+          else
+            echo "❌ Website returned HTTP $response"
+            exit 1
+          fi
+          
+          # Test security headers
+          headers=$(curl -sI "$url" --max-time 30)
+          
+          if echo "$headers" | grep -qi "strict-transport-security"; then
+            echo "✅ HSTS header present"
+          else
+            echo "⚠️ HSTS header missing"
+          fi
+
+      - name: 📊 Deployment Summary
+        run: |
+          echo "## 🚀 Deployment Summary" >> $GITHUB_STEP_SUMMARY
+          echo "" >> $GITHUB_STEP_SUMMARY
+          echo "| Resource | Value |" >> $GITHUB_STEP_SUMMARY
+          echo "|----------|-------|" >> $GITHUB_STEP_SUMMARY
+          echo "| Website URL | https://${{ steps.outputs.outputs.website_url }} |" >> $GITHUB_STEP_SUMMARY
+          echo "| CloudFront Domain | ${{ steps.outputs.outputs.cloudfront_domain }} |" >> $GITHUB_STEP_SUMMARY
+          echo "| S3 Bucket | ${{ steps.outputs.outputs.s3_bucket }} |" >> $GITHUB_STEP_SUMMARY
+          echo "| Distribution ID | ${{ steps.outputs.outputs.distribution_id }} |" >> $GITHUB_STEP_SUMMARY
+          echo "" >> $GITHUB_STEP_SUMMARY
+          echo "### 📈 Monitoring" >> $GITHUB_STEP_SUMMARY
+          echo "- [CloudWatch Dashboard]($(terraform output -raw dashboard_url))" >> $GITHUB_STEP_SUMMARY
+          echo "- [CloudFront Console](https://console.aws.amazon.com/cloudfront/v3/home#/distributions/${{ steps.outputs.outputs.distribution_id }})" >> $GITHUB_STEP_SUMMARY
+
+  destroy:
+    name: 💥 Terraform Destroy
+    runs-on: ubuntu-latest
+    if: github.event_name == 'workflow_dispatch' && github.event.inputs.action == 'destroy'
+    environment: 
+      name: ${{ github.event.inputs.environment || 'production' }}
+    
+    steps:
+      - name: 📥 Checkout Code
+        uses: actions/checkout@v4
+
+      - name: 🔧 Setup Terraform
+        uses: hashicorp/setup-terraform@v3
+        with:
+          terraform_version: ${{ env.TF_VERSION }}
+
+      - name: 🔐 Configure AWS Credentials
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          aws-access-key-id: ${{ secrets.AWS_ACCESS_KEY_ID }}
+          aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+          aws-region: ${{ env.AWS_REGION }}
+
+      - name: 🔧 Terraform Init
+        run: terraform init
+
+      - name: 🗑️ Empty S3 Buckets
+        run: |
+          # Get bucket names
+          website_bucket=$(terraform output -raw s3_bucket_name || echo "")
+          logs_bucket=$(terraform output -raw logs_bucket_name || echo "")
+          
+          # Empty website bucket
+          if [ -n "$website_bucket" ]; then
+            echo "Emptying website bucket: $website_bucket"
+            aws s3 rm s3://$website_bucket --recursive || true
+          fi
+          
+          # Empty logs bucket  
+          if [ -n "$logs_bucket" ]; then
+            echo "Emptying logs bucket: $logs_bucket"
+            aws s3 rm s3://$logs_bucket --recursive || true
+          fi
+
+      - name: 💥 Terraform Destroy
+        run: terraform destroy -auto-approve
+
+  monitor:
+    name: 📊 Post-Deployment Monitoring
+    runs-on: ubuntu-latest
+    needs: apply
+    if: success()
+    
+    steps:
+      - name: 📥 Checkout Code
+        uses: actions/checkout@v4
+
+      - name: 🔐 Configure AWS Credentials
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          aws-access-key-id: ${{ secrets.AWS_ACCESS_KEY_ID }}
+          aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+          aws-region: ${{ env.AWS_REGION }}
+
+      - name: 🔧 Setup Terraform
+        uses: hashicorp/setup-terraform@v3
+        with:
+          terraform_version: ${{ env.TF_VERSION }}
+
+      - name: 🔧 Terraform Init
+        run: terraform init
+
+      - name: 🔍 Run Monitoring Script
+        run: |
+          chmod +x monitoring.sh
+          ./monitoring.sh --quick
+
+      - name: 📧 Setup SNS Subscription (if needed)
+        run: |
+          sns_topic_arn=$(terraform output -raw sns_topic_arn)
+          
+          # Check if email subscription exists
+          subscriptions=$(aws sns list-subscriptions-by-topic --topic-arn "$sns_topic_arn" --query 'Subscriptions[?Protocol==`email`]' --output text)
+          
+          if [ -z "$subscriptions" ]; then
+            echo "⚠️ No email subscriptions found for alerts"
+            echo "To receive alerts, subscribe to: $sns_topic_arn"
+            echo "Run: aws sns subscribe --topic-arn $sns_topic_arn --protocol email --notification-endpoint your-email@example.com"
+          else
+            echo "✅ Email subscription exists for alerts"
+          fi
