@@ -259,7 +259,7 @@ resource "aws_iam_role_policy" "firehose_delivery_policy" {
 
 resource "aws_kinesis_firehose_delivery_stream" "waf_logs" {
   name        = "${var.project_name}-${var.environment}-waf-logs"
-  destination = "s3"
+  destination = "extended_s3"
 
   extended_s3_configuration {
     role_arn           = aws_iam_role.firehose_delivery_role.arn
