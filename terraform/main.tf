@@ -356,7 +356,8 @@ resource "aws_acm_certificate" "website" {
 # ============================================================================
 
 resource "aws_cloudfront_origin_access_control" "website" {
-  name                              = "${var.project_name}-oac"
+  # FIXED: Added random suffix to prevent naming conflicts
+  name                              = "${var.project_name}-oac-${random_id.bucket_suffix.hex}"
   description                       = "OAC for ${var.project_name} website"
   origin_access_control_origin_type = "s3"
   signing_behavior                  = "always"
@@ -453,7 +454,7 @@ resource "aws_wafv2_web_acl" "website" {
     for_each = length(var.allowed_countries) > 0 ? [1] : []
     content {
       name     = "GeoBlockRule"
-      priority = 2
+      priority = 4
 
       action {
         block {}
@@ -602,7 +603,8 @@ resource "aws_cloudfront_distribution" "website" {
 # ============================================================================
 
 resource "aws_cloudfront_response_headers_policy" "security_headers" {
-  name = "${var.project_name}-security-headers"
+  # FIXED: Added random suffix to prevent naming conflicts
+  name = "${var.project_name}-security-headers-${random_id.bucket_suffix.hex}"
 
   security_headers_config {
     strict_transport_security {
