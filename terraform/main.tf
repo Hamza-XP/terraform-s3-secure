@@ -258,7 +258,7 @@ resource "aws_iam_role_policy" "firehose_delivery_policy" {
 }
 
 resource "aws_kinesis_firehose_delivery_stream" "waf_logs" {
-  name        = "${var.project_name}-${var.environment}-waf-logs"
+  name        = "${var.project_name}-${var.environment}-waf-logs-${random_id.bucket_suffix.hex}"
   destination = "extended_s3"
 
   extended_s3_configuration {
@@ -556,7 +556,7 @@ resource "aws_cloudfront_distribution" "website" {
 
   restrictions {
     geo_restriction {
-      restriction_type = "whitelist"
+      restriction_type = length(var.allowed_countries) > 0 ? "whitelist" : "none"
       locations        = var.allowed_countries
     }
   }
