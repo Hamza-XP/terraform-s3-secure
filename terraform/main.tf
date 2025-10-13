@@ -188,7 +188,7 @@ resource "aws_s3_bucket_lifecycle_configuration" "logs" {
 # ============================================================================
 
 resource "aws_cloudwatch_log_group" "waf_logs" {
-  name              = "aws-waf-logs-${var.project_name}-${var.environment}"
+  name              = "aws-waf-logs-${var.project_name}-${var.environment}-${random_id.bucket_suffix.hex}"
   retention_in_days = 30
 
   tags = {
@@ -203,7 +203,7 @@ resource "aws_cloudwatch_log_group" "waf_logs" {
 # ============================================================================
 
 resource "aws_iam_role" "firehose_delivery_role" {
-  name = "${var.project_name}-${var.environment}-firehose-delivery-role"
+  name = "${var.project_name}-${var.environment}-firehose-role-${random_id.bucket_suffix.hex}"
 
   assume_role_policy = jsonencode({
     Version = "2012-10-17"
@@ -225,7 +225,7 @@ resource "aws_iam_role" "firehose_delivery_role" {
 }
 
 resource "aws_iam_role_policy" "firehose_delivery_policy" {
-  name = "${var.project_name}-${var.environment}-firehose-delivery-policy"
+  name = "${var.project_name}-${var.environment}-firehose-policy-${random_id.bucket_suffix.hex}"
   role = aws_iam_role.firehose_delivery_role.id
 
   policy = jsonencode({
@@ -381,8 +381,8 @@ resource "aws_wafv2_web_acl" "website" {
     name     = "RateLimitRule"
     priority = 1
 
-    override_action {
-      none {}
+    action {
+      block {}
     }
 
     statement {
@@ -396,10 +396,6 @@ resource "aws_wafv2_web_acl" "website" {
       cloudwatch_metrics_enabled = true
       metric_name                = "RateLimitRule"
       sampled_requests_enabled   = true
-    }
-
-    action {
-      block {}
     }
   }
 
@@ -449,32 +445,28 @@ resource "aws_wafv2_web_acl" "website" {
     }
   }
 
-  # Geo-blocking rule
-  dynamic "rule" {
-    for_each = length(var.allowed_countries) > 0 ? [1] : []
-    content {
-      name     = "GeoBlockRule"
-      priority = 4
+  rule {
+    name     = "GeoBlockRule"
+    priority = 4
 
-      action {
-        block {}
-      }
+    action {
+      block {}
+    }
 
-      statement {
-        not_statement {
-          statement {
-            geo_match_statement {
-              country_codes = var.allowed_countries
-            }
+    statement {
+      not_statement {
+        statement {
+          geo_match_statement {
+            country_codes = var.allowed_countries
           }
         }
       }
+    }
 
-      visibility_config {
-        cloudwatch_metrics_enabled = true
-        metric_name                = "GeoBlockRule"
-        sampled_requests_enabled   = true
-      }
+    visibility_config {
+      cloudwatch_metrics_enabled = true
+      metric_name                = "GeoBlockRule"
+      sampled_requests_enabled   = true
     }
   }
 
