@@ -75,11 +75,11 @@ output "logs_bucket_arn" {
   value       = aws_s3_bucket.logs.arn
 }
 
-# Monitoring Resources
-output "sns_topic_arn" {
-  description = "ARN of the SNS topic for alerts"
-  value       = aws_sns_topic.alerts.arn
-}
+# # Monitoring Resources
+# output "sns_topic_arn" {
+#   description = "ARN of the SNS topic for alerts"
+#   value       = aws_sns_topic.alerts.arn
+# }
 
 output "cloudwatch_dashboard_name" {
   description = "Name of the CloudWatch dashboard"
@@ -218,7 +218,8 @@ output "next_steps" {
     "1. Configure DNS records using the dns_configuration_help output",
     "2. Validate SSL certificate through DNS or email validation",
     "3. Upload your website files to S3 bucket: ${aws_s3_bucket.website.bucket}",
-    "4. Subscribe to SNS topic ${aws_sns_topic.alerts.arn} for alerts",
+    # "4. Subscribe to SNS topic ${aws_sns_topic.alerts.arn} for alerts",
+    "4. Configure alert notifications (SNS disabled for now)",
     "5. Test website accessibility and security features",
     "6. Configure CloudWatch alarm notifications",
     "7. Review and customize WAF rules if needed",

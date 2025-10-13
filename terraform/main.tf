@@ -679,8 +679,8 @@ resource "aws_cloudwatch_metric_alarm" "high_4xx_error_rate" {
   statistic           = "Average"
   threshold           = "5"
   alarm_description   = "This metric monitors 4xx error rate"
-  alarm_actions       = [aws_sns_topic.alerts.arn]
-  ok_actions          = [aws_sns_topic.alerts.arn]
+  # alarm_actions       = [aws_sns_topic.alerts.arn]
+  # ok_actions          = [aws_sns_topic.alerts.arn]
   treat_missing_data  = "notBreaching"
 
   dimensions = {
@@ -703,8 +703,8 @@ resource "aws_cloudwatch_metric_alarm" "high_5xx_error_rate" {
   statistic           = "Average"
   threshold           = "1"
   alarm_description   = "This metric monitors 5xx error rate"
-  alarm_actions       = [aws_sns_topic.alerts.arn]
-  ok_actions          = [aws_sns_topic.alerts.arn]
+  # alarm_actions       = [aws_sns_topic.alerts.arn]
+  # ok_actions          = [aws_sns_topic.alerts.arn]
   treat_missing_data  = "notBreaching"
 
   dimensions = {
@@ -728,7 +728,7 @@ resource "aws_cloudwatch_metric_alarm" "low_cache_hit_rate" {
   statistic           = "Average"
   threshold           = "80"
   alarm_description   = "This metric monitors CloudFront cache hit rate"
-  alarm_actions       = [aws_sns_topic.alerts.arn]
+  # alarm_actions       = [aws_sns_topic.alerts.arn]
   treat_missing_data  = "notBreaching"
 
   dimensions = {
@@ -752,7 +752,7 @@ resource "aws_cloudwatch_metric_alarm" "high_request_rate" {
   statistic           = "Sum"
   threshold           = "10000"
   alarm_description   = "This metric monitors for unusually high request rates"
-  alarm_actions       = [aws_sns_topic.alerts.arn]
+  # alarm_actions       = [aws_sns_topic.alerts.arn]
   treat_missing_data  = "notBreaching"
 
   dimensions = {
@@ -776,7 +776,7 @@ resource "aws_cloudwatch_metric_alarm" "waf_blocked_requests" {
   statistic           = "Sum"
   threshold           = "100"
   alarm_description   = "This metric monitors WAF blocked requests"
-  alarm_actions       = [aws_sns_topic.alerts.arn]
+  # alarm_actions       = [aws_sns_topic.alerts.arn]
   treat_missing_data  = "notBreaching"
 
   dimensions = {
@@ -795,14 +795,14 @@ resource "aws_cloudwatch_metric_alarm" "waf_blocked_requests" {
 # SNS TOPIC FOR ALERTS
 # ============================================================================
 
-resource "aws_sns_topic" "alerts" {
-  name = "${var.project_name}-${var.environment}-alerts"
+# resource "aws_sns_topic" "alerts" {
+#   name = "${var.project_name}-${var.environment}-alerts"
 
-  tags = {
-    Name        = "${var.project_name}-alerts"
-    Environment = var.environment
-  }
-}
+#   tags = {
+#     Name        = "${var.project_name}-alerts"
+#     Environment = var.environment
+#   }
+# }
 
 # ============================================================================
 # ENHANCED CLOUDWATCH DASHBOARD
