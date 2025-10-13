@@ -40,7 +40,7 @@ provider "aws" {
       Environment = var.environment
       ManagedBy   = "Terraform"
       Owner       = "Infrastructure Team"
-      CreatedAt   = timestamp()
+      # REMOVED: CreatedAt = timestamp() - This causes inconsistent plan errors
     }
   }
 }
@@ -55,7 +55,7 @@ provider "aws" {
       Environment = var.environment
       ManagedBy   = "Terraform"
       Owner       = "Infrastructure Team"
-      CreatedAt   = timestamp()
+      # REMOVED: CreatedAt = timestamp() - This causes inconsistent plan errors
     }
   }
 }
