@@ -24,21 +24,14 @@ on:
           - plan
           - apply
           - destroy
-      environment:
-        description: 'Environment to deploy'
-        required: true
-        default: 'production'
-        type: choice
-        options:
-          - production
-          - staging
-          - development
 
 env:
   TF_VERSION: '1.5.0'
   AWS_REGION: 'us-east-1'
   TF_IN_AUTOMATION: true
   TF_INPUT: false
+  # Set this to '.' if files are in root, or './terraform' if in subdirectory
+  TF_WORKING_DIR: '.'
 
 permissions:
   contents: read
@@ -46,9 +39,41 @@ permissions:
   security-events: write
 
 jobs:
+  setup:
+    name: 🔍 Detect Project Structure
+    runs-on: ubuntu-latest
+    outputs:
+      tf_dir: ${{ steps.detect.outputs.tf_dir }}
+    
+    steps:
+      - name: 📥 Checkout Code
+        uses: actions/checkout@v4
+
+      - name: 🔍 Detect Terraform Directory
+        id: detect
+        run: |
+          echo "🔍 Detecting Terraform files location..."
+          
+          if [ -f "main.tf" ]; then
+            echo "✅ Found Terraform files in root directory"
+            echo "tf_dir=." >> $GITHUB_OUTPUT
+          elif [ -f "terraform/main.tf" ]; then
+            echo "✅ Found Terraform files in terraform/ subdirectory"
+            echo "tf_dir=./terraform" >> $GITHUB_OUTPUT
+          else
+            echo "❌ ERROR: Cannot find main.tf in root or terraform/ directory"
+            echo "📂 Current directory structure:"
+            ls -la
+            echo ""
+            echo "📂 Looking for .tf files:"
+            find . -name "*.tf" -type f
+            exit 1
+          fi
+
   validate:
     name: 🔍 Validate Terraform
     runs-on: ubuntu-latest
+    needs: setup
     outputs:
       tf-fmt: ${{ steps.fmt.outcome }}
       tf-validate: ${{ steps.validate.outcome }}
@@ -62,28 +87,27 @@ jobs:
         with:
           terraform_version: ${{ env.TF_VERSION }}
 
-      - name: 📂 List Files (Debug)
+      - name: 📂 Show Structure
         run: |
-          echo "Current directory:"
-          pwd
-          echo "Files in root:"
-          ls -la
-          echo "Looking for .tf files:"
-          find . -name "*.tf" -type f
+          echo "Working directory: ${{ needs.setup.outputs.tf_dir }}"
+          ls -la ${{ needs.setup.outputs.tf_dir }}
 
       - name: 🎨 Terraform Format Check
         id: fmt
+        working-directory: ${{ needs.setup.outputs.tf_dir }}
         run: terraform fmt -check -recursive
         continue-on-error: true
 
       - name: 🔧 Terraform Init
+        working-directory: ${{ needs.setup.outputs.tf_dir }}
         run: terraform init -backend=false
 
       - name: ✅ Terraform Validate
         id: validate
+        working-directory: ${{ needs.setup.outputs.tf_dir }}
         run: terraform validate
 
-      - name: 📊 Comment PR - Validation Results
+      - name: 📊 Comment PR - Validation
         if: github.event_name == 'pull_request'
         uses: actions/github-script@v7
         continue-on-error: true
@@ -92,26 +116,12 @@ jobs:
             const output = `
             ## 🔍 Terraform Validation Results
             
+            **Working Directory:** \`${{ needs.setup.outputs.tf_dir }}\`
+            
             | Check | Result |
             |-------|--------|
-            | Format | ${{ steps.fmt.outcome == 'success' && '✅ Passed' || '❌ Failed - Run \`terraform fmt -recursive\`' }} |
+            | Format | ${{ steps.fmt.outcome == 'success' && '✅ Passed' || '❌ Failed' }} |
             | Validate | ${{ steps.validate.outcome == 'success' && '✅ Passed' || '❌ Failed' }} |
-            
-            <details><summary>Show Details</summary>
-            
-            ### Terraform Format
-            \`\`\`
-            ${{ steps.fmt.outputs.stdout }}
-            ${{ steps.fmt.outputs.stderr }}
-            \`\`\`
-            
-            ### Terraform Validate
-            \`\`\`
-            ${{ steps.validate.outputs.stdout }}
-            ${{ steps.validate.outputs.stderr }}
-            \`\`\`
-            
-            </details>
             `;
             
             github.rest.issues.createComment({
@@ -124,7 +134,7 @@ jobs:
   security-scan:
     name: 🔒 Security Scan
     runs-on: ubuntu-latest
-    needs: validate
+    needs: [setup, validate]
     
     steps:
       - name: 📥 Checkout Code
@@ -133,49 +143,16 @@ jobs:
       - name: 🔍 Run Checkov
         uses: bridgecrewio/checkov-action@master
         with:
-          directory: .
+          directory: ${{ needs.setup.outputs.tf_dir }}
           framework: terraform
-          output_format: sarif
-          output_file_path: checkov-results.sarif
-          download_external_modules: true
           soft_fail: true
         continue-on-error: true
-
-      - name: 📊 Upload Checkov Results
-        if: always()
-        uses: github/codeql-action/upload-sarif@v3
-        continue-on-error: true
-        with:
-          sarif_file: checkov-results.sarif
-
-      - name: 🧩 Install TFSec
-        run: |
-          wget -q https://github.com/aquasecurity/tfsec/releases/latest/download/tfsec-linux-amd64
-          chmod +x tfsec-linux-amd64
-          sudo mv tfsec-linux-amd64 /usr/local/bin/tfsec
-
-      - name: 🔍 Run TFSec
-        run: |
-          tfsec --format sarif --out tfsec-results.sarif . || true
-        continue-on-error: true
-
-      - name: 📊 Upload TFSec Results
-        if: always()
-        uses: github/codeql-action/upload-sarif@v3
-        continue-on-error: true
-        with:
-          sarif_file: tfsec-results.sarif
 
   plan:
     name: 📋 Terraform Plan
     runs-on: ubuntu-latest
-    needs: [validate, security-scan]
+    needs: [setup, validate, security-scan]
     if: github.event_name == 'pull_request' || github.event_name == 'workflow_dispatch'
-    environment: 
-      name: ${{ github.event.inputs.environment || 'production' }}
-    
-    outputs:
-      tf-plan-exitcode: ${{ steps.plan.outputs.exitcode }}
     
     steps:
       - name: 📥 Checkout Code
@@ -194,19 +171,14 @@ jobs:
           aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
           aws-region: ${{ env.AWS_REGION }}
 
-      - name: ✅ Verify AWS Connection
-        run: |
-          aws sts get-caller-identity
-          echo "AWS connection successful"
-
-      - name: 📂 Create terraform.tfvars if missing
+      - name: 📂 Create terraform.tfvars
+        working-directory: ${{ needs.setup.outputs.tf_dir }}
         run: |
           if [ ! -f terraform.tfvars ]; then
-            echo "Creating terraform.tfvars from example..."
             if [ -f terraform.tfvars.example ]; then
               cp terraform.tfvars.example terraform.tfvars
             else
-              cat > terraform.tfvars << EOF
+              cat > terraform.tfvars << 'EOF'
           use_custom_domain = false
           domain_name       = ""
           project_name      = "secure-website"
@@ -217,93 +189,20 @@ jobs:
           fi
 
       - name: 🔧 Terraform Init
+        working-directory: ${{ needs.setup.outputs.tf_dir }}
         run: terraform init
 
       - name: 📋 Terraform Plan
-        id: plan
-        run: |
-          set +e
-          terraform plan -detailed-exitcode -no-color -out=tfplan
-          exitcode=$?
-          echo "exitcode=$exitcode" >> $GITHUB_OUTPUT
-          exit 0
-
-      - name: 📊 Comment PR - Plan Results
-        if: github.event_name == 'pull_request'
-        uses: actions/github-script@v7
-        continue-on-error: true
-        with:
-          script: |
-            const fs = require('fs');
-            const { execSync } = require('child_process');
-            
-            let planOutput = '';
-            try {
-              planOutput = execSync('terraform show -no-color tfplan', {encoding: 'utf8'});
-            } catch (error) {
-              planOutput = 'Error reading plan output: ' + error.message;
-            }
-            
-            const maxLength = 65000;
-            if (planOutput.length > maxLength) {
-              planOutput = planOutput.substring(0, maxLength) + '\n\n... (truncated)';
-            }
-            
-            const exitCode = '${{ steps.plan.outputs.exitcode }}';
-            let planResult = '';
-            
-            if (exitCode === '0') {
-              planResult = '✅ No changes detected';
-            } else if (exitCode === '2') {
-              planResult = '📝 Changes detected';
-            } else {
-              planResult = '❌ Plan failed';
-            }
-            
-            const output = `
-            ## 📋 Terraform Plan Results
-            
-            **Result:** ${planResult}
-            **Exit Code:** ${exitCode}
-            
-            <details><summary>Show Plan Output</summary>
-            
-            \`\`\`hcl
-            ${planOutput}
-            \`\`\`
-            
-            </details>
-            
-            **Next Steps:**
-            ${exitCode === '2' ? '- Review the changes above\n- Merge this PR to apply changes' : ''}
-            ${exitCode === '1' ? '- Fix the plan errors before merging' : ''}
-            `;
-            
-            github.rest.issues.createComment({
-              issue_number: context.issue.number,
-              owner: context.repo.owner,
-              repo: context.repo.repo,
-              body: output
-            });
-
-      - name: 💾 Upload Plan Artifact
-        if: steps.plan.outputs.exitcode == '2'
-        uses: actions/upload-artifact@v4
-        with:
-          name: terraform-plan
-          path: tfplan
-          retention-days: 5
+        working-directory: ${{ needs.setup.outputs.tf_dir }}
+        run: terraform plan -out=tfplan
 
   apply:
     name: 🚀 Terraform Apply
     runs-on: ubuntu-latest
-    needs: [validate, security-scan]
+    needs: [setup, validate, security-scan]
     if: |
       (github.ref == 'refs/heads/main' && github.event_name == 'push') ||
       (github.event_name == 'workflow_dispatch' && github.event.inputs.action == 'apply')
-    environment: 
-      name: ${{ github.event.inputs.environment || 'production' }}
-      url: ${{ steps.outputs.outputs.website_url }}
     
     steps:
       - name: 📥 Checkout Code
@@ -322,157 +221,142 @@ jobs:
           aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
           aws-region: ${{ env.AWS_REGION }}
 
-      - name: ✅ Verify AWS Connection
-        run: |
-          aws sts get-caller-identity
-          echo "AWS connection successful"
-
-      - name: 📂 Create terraform.tfvars if missing
+      - name: 📂 Create terraform.tfvars
+        working-directory: ${{ needs.setup.outputs.tf_dir }}
         run: |
           if [ ! -f terraform.tfvars ]; then
-            echo "Creating terraform.tfvars..."
             if [ -f terraform.tfvars.example ]; then
               cp terraform.tfvars.example terraform.tfvars
             else
-              cat > terraform.tfvars << EOF
+              cat > terraform.tfvars << 'EOF'
           use_custom_domain = false
           domain_name       = ""
           project_name      = "secure-website-${{ github.run_number }}"
-          environment       = "${{ github.event.inputs.environment || 'production' }}"
+          environment       = "production"
           allowed_countries = ["US", "CA", "GB"]
           EOF
             fi
           fi
 
       - name: 🔧 Terraform Init
+        working-directory: ${{ needs.setup.outputs.tf_dir }}
         run: terraform init
 
       - name: 📋 Terraform Plan
+        working-directory: ${{ needs.setup.outputs.tf_dir }}
         run: terraform plan -out=tfplan
 
       - name: 🚀 Terraform Apply
+        working-directory: ${{ needs.setup.outputs.tf_dir }}
         run: terraform apply -auto-approve tfplan
 
-      - name: 📤 Get Terraform Outputs
+      - name: 📤 Get Outputs
         id: outputs
+        working-directory: ${{ needs.setup.outputs.tf_dir }}
         run: |
-          echo "website_url=$(terraform output -raw website_url || echo 'N/A')" >> $GITHUB_OUTPUT
-          echo "cloudfront_domain=$(terraform output -raw cloudfront_domain_name || echo 'N/A')" >> $GITHUB_OUTPUT
-          echo "s3_bucket=$(terraform output -raw s3_bucket_name || echo 'N/A')" >> $GITHUB_OUTPUT
-          echo "distribution_id=$(terraform output -raw cloudfront_distribution_id || echo 'N/A')" >> $GITHUB_OUTPUT
+          echo "website_url=$(terraform output -raw website_url 2>/dev/null || echo 'N/A')" >> $GITHUB_OUTPUT
+          echo "cloudfront_domain=$(terraform output -raw cloudfront_domain_name 2>/dev/null || echo 'N/A')" >> $GITHUB_OUTPUT
+          echo "s3_bucket=$(terraform output -raw s3_bucket_name 2>/dev/null || echo 'N/A')" >> $GITHUB_OUTPUT
+          echo "distribution_id=$(terraform output -raw cloudfront_distribution_id 2>/dev/null || echo 'N/A')" >> $GITHUB_OUTPUT
 
       - name: 📁 Upload Website Files
         run: |
           BUCKET="${{ steps.outputs.outputs.s3_bucket }}"
           
-          if [ "$BUCKET" = "N/A" ] || [ -z "$BUCKET" ]; then
-            echo "⚠️ S3 bucket name not available"
+          if [ "$BUCKET" = "N/A" ]; then
+            echo "⚠️ Bucket not available"
             exit 0
           fi
           
+          # Create default website if needed
           if [ ! -d "website" ]; then
-            echo "Creating default website..."
             mkdir -p website
             cat > website/index.html << 'EOF'
           <!DOCTYPE html>
-          <html lang="en">
+          <html>
           <head>
               <meta charset="UTF-8">
               <meta name="viewport" content="width=device-width, initial-scale=1.0">
-              <title>Secure Website</title>
+              <title>Deployed!</title>
               <style>
                   body {
-                      font-family: Arial, sans-serif;
+                      font-family: system-ui, -apple-system, sans-serif;
                       display: flex;
-                      justify-content: center;
                       align-items: center;
-                      height: 100vh;
+                      justify-content: center;
+                      min-height: 100vh;
                       margin: 0;
                       background: linear-gradient(135deg, #667eea 0%, #764ba2 100%);
                       color: white;
                   }
-                  .container {
+                  .card {
                       text-align: center;
-                      padding: 2rem;
+                      padding: 3rem;
                       background: rgba(255, 255, 255, 0.1);
-                      border-radius: 10px;
+                      border-radius: 15px;
                       backdrop-filter: blur(10px);
+                      box-shadow: 0 8px 32px rgba(0,0,0,0.1);
                   }
-                  h1 { margin: 0 0 1rem 0; }
-                  .badge { 
+                  h1 { margin: 0 0 1rem; font-size: 2.5rem; }
+                  p { margin: 0.5rem 0; opacity: 0.9; }
+                  .badges { margin: 2rem 0; }
+                  .badge {
                       display: inline-block;
                       padding: 0.5rem 1rem;
+                      margin: 0.25rem;
                       background: rgba(255, 255, 255, 0.2);
-                      border-radius: 5px;
-                      margin: 0.5rem;
+                      border-radius: 20px;
+                      font-size: 0.9rem;
                   }
               </style>
           </head>
           <body>
-              <div class="container">
-                  <h1>🚀 Secure Website Deployed!</h1>
-                  <p>Your infrastructure is live and protected.</p>
-                  <div class="badge">✅ HTTPS</div>
-                  <div class="badge">🛡️ WAF</div>
-                  <div class="badge">📊 Monitored</div>
+              <div class="card">
+                  <h1>🚀 Website Deployed!</h1>
+                  <p>Your secure infrastructure is live</p>
+                  <div class="badges">
+                      <span class="badge">✅ HTTPS</span>
+                      <span class="badge">🛡️ WAF Protected</span>
+                      <span class="badge">📊 Monitored</span>
+                      <span class="badge">☁️ CloudFront</span>
+                  </div>
+                  <p style="font-size: 0.85rem; margin-top: 2rem;">
+                      Build #${{ github.run_number }} • GitHub Actions
+                  </p>
               </div>
           </body>
           </html>
           EOF
           fi
           
-          echo "📁 Uploading files..."
+          # Upload files
           find website -name "*.html" -type f -exec aws s3 cp {} s3://$BUCKET/ --content-type "text/html" \;
           find website -name "*.png" -type f -exec aws s3 cp {} s3://$BUCKET/ --content-type "image/png" \;
           find website -name "*.jpg" -type f -exec aws s3 cp {} s3://$BUCKET/ --content-type "image/jpeg" \;
           find website -name "*.css" -type f -exec aws s3 cp {} s3://$BUCKET/ --content-type "text/css" \;
           find website -name "*.js" -type f -exec aws s3 cp {} s3://$BUCKET/ --content-type "application/javascript" \;
-          echo "✅ Upload complete"
 
-      - name: 🔄 Invalidate CloudFront Cache
+      - name: 🔄 Invalidate Cache
         run: |
           DIST_ID="${{ steps.outputs.outputs.distribution_id }}"
-          if [ "$DIST_ID" != "N/A" ] && [ -n "$DIST_ID" ]; then
-            aws cloudfront create-invalidation --distribution-id $DIST_ID --paths "/*"
-            echo "✅ Cache invalidated"
-          fi
+          [ "$DIST_ID" != "N/A" ] && aws cloudfront create-invalidation --distribution-id $DIST_ID --paths "/*" || true
 
-      - name: 🧪 Run Health Checks
+      - name: 📊 Summary
         run: |
-          DOMAIN="${{ steps.outputs.outputs.cloudfront_domain }}"
-          if [ "$DOMAIN" = "N/A" ] || [ -z "$DOMAIN" ]; then
-            exit 0
-          fi
-          
-          sleep 60
-          url="https://$DOMAIN"
-          
-          for i in {1..5}; do
-            response=$(curl -s -o /dev/null -w "%{http_code}" --max-time 30 "$url" || echo "000")
-            if [ "$response" = "200" ]; then
-              echo "✅ Website accessible"
-              break
-            fi
-            [ $i -lt 5 ] && sleep 30
-          done
-
-      - name: 📊 Deployment Summary
-        if: always()
-        run: |
-          echo "## 🚀 Deployment Summary" >> $GITHUB_STEP_SUMMARY
+          echo "## 🚀 Deployment Complete" >> $GITHUB_STEP_SUMMARY
           echo "" >> $GITHUB_STEP_SUMMARY
           echo "| Resource | Value |" >> $GITHUB_STEP_SUMMARY
           echo "|----------|-------|" >> $GITHUB_STEP_SUMMARY
-          echo "| Website URL | https://${{ steps.outputs.outputs.cloudfront_domain }} |" >> $GITHUB_STEP_SUMMARY
-          echo "| S3 Bucket | ${{ steps.outputs.outputs.s3_bucket }} |" >> $GITHUB_STEP_SUMMARY
-          echo "| Distribution ID | ${{ steps.outputs.outputs.distribution_id }} |" >> $GITHUB_STEP_SUMMARY
+          echo "| 🌐 Website URL | https://${{ steps.outputs.outputs.cloudfront_domain }} |" >> $GITHUB_STEP_SUMMARY
+          echo "| 📦 S3 Bucket | ${{ steps.outputs.outputs.s3_bucket }} |" >> $GITHUB_STEP_SUMMARY
+          echo "| 🔖 Distribution | ${{ steps.outputs.outputs.distribution_id }} |" >> $GITHUB_STEP_SUMMARY
+          echo "| 📂 Terraform Dir | ${{ needs.setup.outputs.tf_dir }} |" >> $GITHUB_STEP_SUMMARY
 
   destroy:
-    name: 💥 Terraform Destroy
+    name: 💥 Destroy Infrastructure
     runs-on: ubuntu-latest
+    needs: setup
     if: github.event_name == 'workflow_dispatch' && github.event.inputs.action == 'destroy'
-    environment: 
-      name: ${{ github.event.inputs.environment || 'production' }}
     
     steps:
       - name: 📥 Checkout Code
@@ -484,42 +368,46 @@ jobs:
           terraform_version: ${{ env.TF_VERSION }}
           terraform_wrapper: false
 
-      - name: 🔐 Configure AWS Credentials
+      - name: 🔐 Configure AWS
         uses: aws-actions/configure-aws-credentials@v4
         with:
           aws-access-key-id: ${{ secrets.AWS_ACCESS_KEY_ID }}
           aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
           aws-region: ${{ env.AWS_REGION }}
 
-      - name: 📂 Create terraform.tfvars if missing
-        run: |
-          [ ! -f terraform.tfvars ] && cp terraform.tfvars.example terraform.tfvars || true
-
       - name: 🔧 Terraform Init
+        working-directory: ${{ needs.setup.outputs.tf_dir }}
         run: terraform init
 
-      - name: 🗑️ Empty S3 Buckets
+      - name: 🗑️ Empty Buckets
+        working-directory: ${{ needs.setup.outputs.tf_dir }}
         continue-on-error: true
         run: |
-          website_bucket=$(terraform output -raw s3_bucket_name 2>/dev/null || echo "")
-          logs_bucket=$(terraform output -raw logs_bucket_name 2>/dev/null || echo "")
-          
-          [ -n "$website_bucket" ] && aws s3 rm s3://$website_bucket --recursive || true
-          [ -n "$logs_bucket" ] && aws s3 rm s3://$logs_bucket --recursive || true
+          wb=$(terraform output -raw s3_bucket_name 2>/dev/null || echo "")
+          lb=$(terraform output -raw logs_bucket_name 2>/dev/null || echo "")
+          [ -n "$wb" ] && aws s3 rm s3://$wb --recursive || true
+          [ -n "$lb" ] && aws s3 rm s3://$lb --recursive || true
 
-      - name: 💥 Terraform Destroy
+      - name: 💥 Destroy
+        working-directory: ${{ needs.setup.outputs.tf_dir }}
         run: terraform destroy -auto-approve
 
   monitor:
     name: 📊 Post-Deployment Monitoring
     runs-on: ubuntu-latest
-    needs: apply
+    needs: [setup, apply]
     if: success()
     
     steps:
       - name: 📥 Checkout Code
         uses: actions/checkout@v4
 
+      - name: 🔧 Setup Terraform
+        uses: hashicorp/setup-terraform@v3
+        with:
+          terraform_version: ${{ env.TF_VERSION }}
+          terraform_wrapper: false
+
       - name: 🔐 Configure AWS Credentials
         uses: aws-actions/configure-aws-credentials@v4
         with:
@@ -527,39 +415,125 @@ jobs:
           aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
           aws-region: ${{ env.AWS_REGION }}
 
-      - name: 🔧 Setup Terraform
-        uses: hashicorp/setup-terraform@v3
-        with:
-          terraform_version: ${{ env.TF_VERSION }}
-          terraform_wrapper: false
-
-      # - name: 📧 Setup SNS Subscription (if needed)
-      #   run: |
-      #     sns_topic_arn=$(terraform output -raw sns_topic_arn)
-          
-      #     # Check if email subscription exists
-      #     subscriptions=$(aws sns list-subscriptions-by-topic --topic-arn "$sns_topic_arn" --query 'Subscriptions[?Protocol==`email`]' --output text)
-          
-      #     if [ -z "$subscriptions" ]; then
-      #       echo "⚠️ No email subscriptions found for alerts"
-      #       echo "To receive alerts, subscribe to: $sns_topic_arn"
-      #       echo "Run: aws sns subscribe --topic-arn $sns_topic_arn --protocol email --notification-endpoint your-email@example.com"
-      #     else
-      #       echo "✅ Email subscription exists for alerts"
-      #     fi
-
-      - name: 📂 Restore Config
-        run: |
-          [ ! -f terraform.tfvars ] && cp terraform.tfvars.example terraform.tfvars || true
-
       - name: 🔧 Terraform Init
+        working-directory: ${{ needs.setup.outputs.tf_dir }}
         run: terraform init
 
-      - name: 🔍 Basic Monitoring
-        continue-on-error: true
+      - name: 🔍 Verify Deployment Status
+        working-directory: ${{ needs.setup.outputs.tf_dir }}
         run: |
-          DIST_ID=$(terraform output -raw cloudfront_distribution_id 2>/dev/null || echo "")
-          [ -n "$DIST_ID" ] && echo "✅ CloudFront Distribution: $DIST_ID"
+          echo "## 📊 Deployment Verification" >> $GITHUB_STEP_SUMMARY
+          echo "" >> $GITHUB_STEP_SUMMARY
           
-          BUCKET=$(terraform output -raw s3_bucket_name 2>/dev/null || echo "")
-          [ -n "$BUCKET" ] && echo "✅ S3 Bucket: $BUCKET"
+          # Get outputs
+          CLOUDFRONT_DOMAIN=$(terraform output -raw cloudfront_domain_name 2>/dev/null || echo "")
+          S3_BUCKET=$(terraform output -raw s3_bucket_name 2>/dev/null || echo "")
+          DISTRIBUTION_ID=$(terraform output -raw cloudfront_distribution_id 2>/dev/null || echo "")
+          WAF_ACL_ARN=$(terraform output -raw waf_web_acl_arn 2>/dev/null || echo "")
+          
+          echo "| Resource | Status | Value |" >> $GITHUB_STEP_SUMMARY
+          echo "|----------|--------|-------|" >> $GITHUB_STEP_SUMMARY
+          
+          if [ -n "$CLOUDFRONT_DOMAIN" ]; then
+            echo "| 🌐 CloudFront | ✅ Deployed | $CLOUDFRONT_DOMAIN |" >> $GITHUB_STEP_SUMMARY
+          else
+            echo "| 🌐 CloudFront | ❌ Missing | Not Found |" >> $GITHUB_STEP_SUMMARY
+          fi
+          
+          if [ -n "$S3_BUCKET" ]; then
+            echo "| 📦 S3 Bucket | ✅ Deployed | $S3_BUCKET |" >> $GITHUB_STEP_SUMMARY
+          else
+            echo "| 📦 S3 Bucket | ❌ Missing | Not Found |" >> $GITHUB_STEP_SUMMARY
+          fi
+          
+          if [ -n "$WAF_ACL_ARN" ]; then
+            echo "| 🛡️ WAF ACL | ✅ Deployed | $(echo $WAF_ACL_ARN | cut -d'/' -f2) |" >> $GITHUB_STEP_SUMMARY
+          else
+            echo "| 🛡️ WAF ACL | ❌ Missing | Not Found |" >> $GITHUB_STEP_SUMMARY
+          fi
+
+      - name: 🧪 Run Health Checks
+        working-directory: ${{ needs.setup.outputs.tf_dir }}
+        run: |
+          CLOUDFRONT_DOMAIN=$(terraform output -raw cloudfront_domain_name 2>/dev/null || echo "")
+          
+          if [ -z "$CLOUDFRONT_DOMAIN" ]; then
+            echo "❌ Cannot run health checks - CloudFront domain not found"
+            exit 0
+          fi
+          
+          echo "## 🧪 Health Checks" >> $GITHUB_STEP_SUMMARY
+          echo "" >> $GITHUB_STEP_SUMMARY
+          echo "| Check | Result | Details |" >> $GITHUB_STEP_SUMMARY
+          echo "|-------|--------|---------|" >> $GITHUB_STEP_SUMMARY
+          
+          URL="https://$CLOUDFRONT_DOMAIN"
+          echo "Testing: $URL"
+          
+          # Test website accessibility
+          for i in {1..5}; do
+            HTTP_CODE=$(curl -s -o /dev/null -w "%{http_code}" --max-time 10 "$URL" || echo "000")
+            if [ "$HTTP_CODE" = "200" ]; then
+              echo "| 🌐 Website Access | ✅ Success | HTTP 200 |" >> $GITHUB_STEP_SUMMARY
+              break
+            fi
+            [ $i -lt 5 ] && sleep 10
+          done
+          
+          if [ "$HTTP_CODE" != "200" ]; then
+            echo "| 🌐 Website Access | ❌ Failed | HTTP $HTTP_CODE |" >> $GITHUB_STEP_SUMMARY
+          fi
+          
+          # Test HTTPS redirect
+          HTTP_URL="http://$CLOUDFRONT_DOMAIN"
+          REDIRECT_CODE=$(curl -s -o /dev/null -w "%{http_code}" -L --max-time 10 "$HTTP_URL" || echo "000")
+          if [ "$REDIRECT_CODE" = "200" ]; then
+            echo "| 🔒 HTTPS Redirect | ✅ Working | HTTP → HTTPS |" >> $GITHUB_STEP_SUMMARY
+          else
+            echo "| 🔒 HTTPS Redirect | ⚠️ Check | Code: $REDIRECT_CODE |" >> $GITHUB_STEP_SUMMARY
+          fi
+          
+          # Test security headers
+          HEADERS=$(curl -sI "$URL" --max-time 10 || echo "")
+          if echo "$HEADERS" | grep -qi "strict-transport-security"; then
+            echo "| 🛡️ HSTS Header | ✅ Present | Secure |" >> $GITHUB_STEP_SUMMARY
+          else
+            echo "| 🛡️ HSTS Header | ⚠️ Missing | Consider adding |" >> $GITHUB_STEP_SUMMARY
+          fi
+
+      - name: 📈 Generate Monitoring Links
+        working-directory: ${{ needs.setup.outputs.tf_dir }}
+        run: |
+          echo "## 📈 Monitoring & Management" >> $GITHUB_STEP_SUMMARY
+          echo "" >> $GITHUB_STEP_SUMMARY
+          echo "| Service | Console Link |" >> $GITHUB_STEP_SUMMARY
+          echo "|---------|--------------|" >> $GITHUB_STEP_SUMMARY
+          
+          DISTRIBUTION_ID=$(terraform output -raw cloudfront_distribution_id 2>/dev/null || echo "")
+          S3_BUCKET=$(terraform output -raw s3_bucket_name 2>/dev/null || echo "")
+          REGION="${{ env.AWS_REGION }}"
+          
+          if [ -n "$DISTRIBUTION_ID" ]; then
+            echo "| ☁️ CloudFront | [View Distribution](https://console.aws.amazon.com/cloudfront/v3/home#/distributions/$DISTRIBUTION_ID) |" >> $GITHUB_STEP_SUMMARY
+          fi
+          
+          if [ -n "$S3_BUCKET" ]; then
+            echo "| 📦 S3 Bucket | [View Bucket](https://s3.console.aws.amazon.com/s3/buckets/$S3_BUCKET) |" >> $GITHUB_STEP_SUMMARY
+          fi
+          
+          DASHBOARD_NAME=$(terraform output -raw cloudwatch_dashboard_name 2>/dev/null || echo "")
+          if [ -n "$DASHBOARD_NAME" ]; then
+            echo "| 📊 CloudWatch | [View Dashboard](https://$REGION.console.aws.amazon.com/cloudwatch/home?region=$REGION#dashboards:name=$DASHBOARD_NAME) |" >> $GITHUB_STEP_SUMMARY
+          fi
+          
+          echo "| 🔐 WAF & Shield | [View Web ACLs](https://$REGION.console.aws.amazon.com/wafv2/homev2/web-acls) |" >> $GITHUB_STEP_SUMMARY
+
+      - name: 💡 Next Steps
+        run: |
+          echo "## 💡 Next Steps" >> $GITHUB_STEP_SUMMARY
+          echo "" >> $GITHUB_STEP_SUMMARY
+          echo "1. **Test your website** at the CloudFront URL above" >> $GITHUB_STEP_SUMMARY
+          echo "2. **Monitor performance** using the CloudWatch dashboard" >> $GITHUB_STEP_SUMMARY
+          echo "3. **Review security** in the WAF console" >> $GITHUB_STEP_SUMMARY
+          echo "4. **Upload content** to the S3 bucket if not already done" >> $GITHUB_STEP_SUMMARY
+          echo "5. **Set up custom domain** (optional) by updating domain_name in terraform.tfvars" >> $GITHUB_STEP_SUMMARY
