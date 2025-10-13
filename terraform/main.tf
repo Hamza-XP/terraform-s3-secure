@@ -1,19 +1,4 @@
 # ============================================================================
-# TERRAFORM CONFIGURATION
-# Production-Ready S3 + CloudFront + WAF + SSL + Monitoring Setup
-# ============================================================================
-
-terraform {
-  required_version = ">= 1.0"
-  required_providers {
-    aws = {
-      source  = "hashicorp/aws"
-      version = "~> 5.0"
-    }
-  }
-}
-
-# ============================================================================
 # VARIABLES
 # ============================================================================
 
@@ -981,48 +966,4 @@ resource "aws_cloudwatch_dashboard" "website" {
       }
     ]
   })
-}
-
-# ============================================================================
-# OUTPUTS
-# ============================================================================
-
-output "cloudfront_distribution_id" {
-  description = "ID of the CloudFront distribution"
-  value       = aws_cloudfront_distribution.website.id
-}
-
-output "cloudfront_domain_name" {
-  description = "Domain name of the CloudFront distribution"
-  value       = aws_cloudfront_distribution.website.domain_name
-}
-
-output "s3_bucket_name" {
-  description = "Name of the S3 bucket"
-  value       = aws_s3_bucket.website.bucket
-}
-
-output "waf_web_acl_arn" {
-  description = "ARN of the WAF Web ACL"
-  value       = aws_wafv2_web_acl.website.arn
-}
-
-output "ssl_certificate_arn" {
-  description = "ARN of the SSL certificate"
-  value       = aws_acm_certificate.website.arn
-}
-
-output "logs_bucket_name" {
-  description = "Name of the logs S3 bucket"
-  value       = aws_s3_bucket.logs.bucket
-}
-
-output "sns_topic_arn" {
-  description = "ARN of the SNS topic for alerts"
-  value       = aws_sns_topic.alerts.arn
-}
-
-output "dashboard_url" {
-  description = "URL of the CloudWatch dashboard"
-  value       = "https://${data.aws_region.current.name}.console.aws.amazon.com/cloudwatch/home?region=${data.aws_region.current.name}#dashboards:name=${aws_cloudwatch_dashboard.website.dashboard_name}"
 }
