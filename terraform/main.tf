@@ -445,28 +445,31 @@ resource "aws_wafv2_web_acl" "website" {
     }
   }
 
-  rule {
-    name     = "GeoBlockRule"
-    priority = 4
+  dynamic "rule" {
+    for_each = length(var.allowed_countries) > 0 ? [1] : []
+    content {
+      name     = "GeoBlockRule"
+      priority = 4
 
-    action {
-      block {}
-    }
+      action {
+        block {}
+      }
 
-    statement {
-      not_statement {
-        statement {
-          geo_match_statement {
-            country_codes = var.allowed_countries
+      statement {
+        not_statement {
+          statement {
+            geo_match_statement {
+              country_codes = var.allowed_countries
+            }
           }
         }
       }
-    }
 
-    visibility_config {
-      cloudwatch_metrics_enabled = true
-      metric_name                = "GeoBlockRule"
-      sampled_requests_enabled   = true
+      visibility_config {
+        cloudwatch_metrics_enabled = true
+        metric_name                = "GeoBlockRule"
+        sampled_requests_enabled   = true
+      }
     }
   }
 
