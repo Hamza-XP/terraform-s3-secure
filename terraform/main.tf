@@ -261,13 +261,13 @@ resource "aws_kinesis_firehose_delivery_stream" "waf_logs" {
   name        = "${var.project_name}-${var.environment}-waf-logs"
   destination = "s3"
 
-  s3_configuration {
+  extended_s3_configuration {
     role_arn           = aws_iam_role.firehose_delivery_role.arn
     bucket_arn         = aws_s3_bucket.logs.arn
     prefix             = "waf-logs/year=!{timestamp:yyyy}/month=!{timestamp:MM}/day=!{timestamp:dd}/hour=!{timestamp:HH}/"
     error_output_prefix = "waf-logs-errors/"
-    buffer_size        = 5
-    buffer_interval    = 300
+    buffering_size        = 5
+    buffering_interval    = 300
     compression_format = "GZIP"
 
     cloudwatch_logging_options {

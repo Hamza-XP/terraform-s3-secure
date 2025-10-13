@@ -51,6 +51,12 @@ output "ssl_certificate_arn" {
   description = "ARN of the SSL certificate"
   value       = aws_acm_certificate.website.arn
 }
+
+output "ssl_certificate_domain_validation_options" {
+  description = "Domain validation options for the SSL certificate"
+  value       = aws_acm_certificate.website.domain_validation_options
+  sensitive   = false
+}
 */
 # CHANGED TO:
 output "ssl_certificate_arn" {
@@ -60,7 +66,7 @@ output "ssl_certificate_arn" {
 
 output "ssl_certificate_domain_validation_options" {
   description = "Domain validation options for the SSL certificate"
-  value       = aws_acm_certificate.website.domain_validation_options
+  value       = "Using CloudFront default certificate"
   sensitive   = false
 }
 
