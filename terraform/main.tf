@@ -198,6 +198,20 @@ resource "aws_cloudwatch_log_group" "waf_logs" {
   }
 }
 
+resource "aws_s3_bucket_ownership_controls" "logs" {
+  bucket = aws_s3_bucket.logs.id
+
+  rule {
+    object_ownership = "BucketOwnerPreferred"
+  }
+}
+
+resource "aws_s3_bucket_acl" "logs" {
+  depends_on = [aws_s3_bucket_ownership_controls.logs]
+  bucket     = aws_s3_bucket.logs.id
+  acl        = "private"
+}
+
 # ============================================================================
 # KINESIS FIREHOSE FOR WAF LOGS TO S3
 # ============================================================================
@@ -258,17 +272,17 @@ resource "aws_iam_role_policy" "firehose_delivery_policy" {
 }
 
 resource "aws_kinesis_firehose_delivery_stream" "waf_logs" {
-  name        = "${var.project_name}-${var.environment}-waf-logs-${random_id.bucket_suffix.hex}"
+  name        = "aws-waf-logs-${var.project_name}-${var.environment}-${random_id.bucket_suffix.hex}"
   destination = "extended_s3"
 
   extended_s3_configuration {
-    role_arn           = aws_iam_role.firehose_delivery_role.arn
-    bucket_arn         = aws_s3_bucket.logs.arn
-    prefix             = "waf-logs/year=!{timestamp:yyyy}/month=!{timestamp:MM}/day=!{timestamp:dd}/hour=!{timestamp:HH}/"
+    role_arn            = aws_iam_role.firehose_delivery_role.arn
+    bucket_arn          = aws_s3_bucket.logs.arn
+    prefix              = "waf-logs/year=!{timestamp:yyyy}/month=!{timestamp:MM}/day=!{timestamp:dd}/hour=!{timestamp:HH}/"
     error_output_prefix = "waf-logs-errors/"
-    buffering_size        = 5
-    buffering_interval    = 300
-    compression_format = "GZIP"
+    buffering_size      = 5
+    buffering_interval  = 300
+    compression_format  = "GZIP"
 
     cloudwatch_logging_options {
       enabled         = true
@@ -276,7 +290,6 @@ resource "aws_kinesis_firehose_delivery_stream" "waf_logs" {
       log_stream_name = "S3Delivery"
     }
   }
-
 }
 
 # ============================================================================
@@ -490,6 +503,11 @@ resource "aws_wafv2_web_acl" "website" {
 # ============================================================================
 
 resource "aws_cloudfront_distribution" "website" {
+  depends_on = [
+    aws_s3_bucket_acl.logs,
+    aws_s3_bucket_ownership_controls.logs
+  ]
+
   origin {
     domain_name              = aws_s3_bucket.website.bucket_regional_domain_name
     origin_access_control_id = aws_cloudfront_origin_access_control.website.id
