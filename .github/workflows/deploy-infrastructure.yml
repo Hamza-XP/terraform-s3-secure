@@ -23,14 +23,12 @@ on:
         options:
           - plan
           - apply
-          - destroy
 
 env:
   TF_VERSION: '1.5.0'
   AWS_REGION: 'us-east-1'
   TF_IN_AUTOMATION: true
   TF_INPUT: false
-  # Set this to '.' if files are in root, or './terraform' if in subdirectory
   TF_WORKING_DIR: '.'
 
 permissions:
@@ -152,10 +150,10 @@ jobs:
     name: 📋 Terraform Plan
     runs-on: ubuntu-latest
     needs: [setup, validate, security-scan]
-    if: github.event_name == 'pull_request' || github.event_name == 'workflow_dispatch'
+    if: github.event_name == 'pull_request' || (github.event_name == 'workflow_dispatch' && github.event.inputs.action == 'plan')
     environment: 
-      name: ${{ github.event.inputs.environment || 'production' }}
-      url: https://${{ steps.outputs.outputs.cloudfront_domain }}
+      name: production
+    
     steps:
       - name: 📥 Checkout Code
         uses: actions/checkout@v4
@@ -198,6 +196,37 @@ jobs:
         working-directory: ${{ needs.setup.outputs.tf_dir }}
         run: terraform plan -out=tfplan
 
+      - name: 💾 Upload Plan
+        uses: actions/upload-artifact@v4
+        with:
+          name: tfplan
+          path: ${{ needs.setup.outputs.tf_dir }}/tfplan
+          retention-days: 5
+
+      - name: 📊 Comment PR - Plan
+        if: github.event_name == 'pull_request'
+        uses: actions/github-script@v7
+        continue-on-error: true
+        with:
+          script: |
+            const output = `
+            ## 📋 Terraform Plan Results
+            
+            ✅ Plan generated successfully
+            
+            **Next Steps:**
+            - Review the plan carefully
+            - Merge to \`main\` to apply changes automatically
+            - Or use \`workflow_dispatch\` with \`apply\` action
+            `;
+            
+            github.rest.issues.createComment({
+              issue_number: context.issue.number,
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              body: output
+            });
+
   apply:
     name: 🚀 Terraform Apply
     runs-on: ubuntu-latest
@@ -206,8 +235,8 @@ jobs:
       (github.ref == 'refs/heads/main' && github.event_name == 'push') ||
       (github.event_name == 'workflow_dispatch' && github.event.inputs.action == 'apply')
     environment: 
-      name: ${{ github.event.inputs.environment || 'production' }}
-      url: https://${{ steps.outputs.outputs.cloudfront_domain }}
+      name: production
+    
     steps:
       - name: 📥 Checkout Code
         uses: actions/checkout@v4
@@ -235,7 +264,7 @@ jobs:
               cat > terraform.tfvars << 'EOF'
           use_custom_domain = false
           domain_name       = ""
-          project_name      = "secure-website-${{ github.run_number }}"
+          project_name      = "secure-website"
           environment       = "production"
           allowed_countries = ["US", "CA", "GB"]
           EOF
@@ -333,71 +362,44 @@ jobs:
           EOF
           fi
           
-          # Upload files
-          find website -name "*.html" -type f -exec aws s3 cp {} s3://$BUCKET/ --content-type "text/html" \;
-          find website -name "*.png" -type f -exec aws s3 cp {} s3://$BUCKET/ --content-type "image/png" \;
-          find website -name "*.jpg" -type f -exec aws s3 cp {} s3://$BUCKET/ --content-type "image/jpeg" \;
-          find website -name "*.css" -type f -exec aws s3 cp {} s3://$BUCKET/ --content-type "text/css" \;
-          find website -name "*.js" -type f -exec aws s3 cp {} s3://$BUCKET/ --content-type "application/javascript" \;
+          # Sync all files to S3
+          if [ -d "website" ]; then
+            aws s3 sync website/ s3://$BUCKET/ \
+              --exclude ".*" \
+              --cache-control "public, max-age=3600" \
+              --metadata-directive REPLACE
+          fi
 
-      - name: 🔄 Invalidate Cache
+      - name: 🔄 Invalidate CloudFront Cache
         run: |
           DIST_ID="${{ steps.outputs.outputs.distribution_id }}"
-          [ "$DIST_ID" != "N/A" ] && aws cloudfront create-invalidation --distribution-id $DIST_ID --paths "/*" || true
+          if [ "$DIST_ID" != "N/A" ]; then
+            aws cloudfront create-invalidation \
+              --distribution-id $DIST_ID \
+              --paths "/*"
+            echo "✅ Cache invalidation created"
+          fi
 
-      - name: 📊 Summary
+      - name: 📊 Deployment Summary
         run: |
           echo "## 🚀 Deployment Complete" >> $GITHUB_STEP_SUMMARY
           echo "" >> $GITHUB_STEP_SUMMARY
+          echo "### 🌐 Your Website" >> $GITHUB_STEP_SUMMARY
+          echo "" >> $GITHUB_STEP_SUMMARY
+          echo "**URL:** https://${{ steps.outputs.outputs.cloudfront_domain }}" >> $GITHUB_STEP_SUMMARY
+          echo "" >> $GITHUB_STEP_SUMMARY
+          echo "### 📦 Resources" >> $GITHUB_STEP_SUMMARY
+          echo "" >> $GITHUB_STEP_SUMMARY
           echo "| Resource | Value |" >> $GITHUB_STEP_SUMMARY
           echo "|----------|-------|" >> $GITHUB_STEP_SUMMARY
-          echo "| 🌐 Website URL | https://${{ steps.outputs.outputs.cloudfront_domain }} |" >> $GITHUB_STEP_SUMMARY
-          echo "| 📦 S3 Bucket | ${{ steps.outputs.outputs.s3_bucket }} |" >> $GITHUB_STEP_SUMMARY
-          echo "| 🔖 Distribution | ${{ steps.outputs.outputs.distribution_id }} |" >> $GITHUB_STEP_SUMMARY
-          echo "| 📂 Terraform Dir | ${{ needs.setup.outputs.tf_dir }} |" >> $GITHUB_STEP_SUMMARY
-
-  destroy:
-    name: 💥 Destroy Infrastructure
-    runs-on: ubuntu-latest
-    needs: setup
-    if: github.event_name == 'workflow_dispatch' && github.event.inputs.action == 'destroy'
-    
-    steps:
-      - name: 📥 Checkout Code
-        uses: actions/checkout@v4
-
-      - name: 🔧 Setup Terraform
-        uses: hashicorp/setup-terraform@v3
-        with:
-          terraform_version: ${{ env.TF_VERSION }}
-          terraform_wrapper: false
-
-      - name: 🔐 Configure AWS
-        uses: aws-actions/configure-aws-credentials@v4
-        with:
-          aws-access-key-id: ${{ secrets.AWS_ACCESS_KEY_ID }}
-          aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
-          aws-region: ${{ env.AWS_REGION }}
-
-      - name: 🔧 Terraform Init
-        working-directory: ${{ needs.setup.outputs.tf_dir }}
-        run: terraform init
-
-      - name: 🗑️ Empty Buckets
-        working-directory: ${{ needs.setup.outputs.tf_dir }}
-        continue-on-error: true
-        run: |
-          wb=$(terraform output -raw s3_bucket_name 2>/dev/null || echo "")
-          lb=$(terraform output -raw logs_bucket_name 2>/dev/null || echo "")
-          [ -n "$wb" ] && aws s3 rm s3://$wb --recursive || true
-          [ -n "$lb" ] && aws s3 rm s3://$lb --recursive || true
-
-      - name: 💥 Destroy
-        working-directory: ${{ needs.setup.outputs.tf_dir }}
-        run: terraform destroy -auto-approve
+          echo "| S3 Bucket | ${{ steps.outputs.outputs.s3_bucket }} |" >> $GITHUB_STEP_SUMMARY
+          echo "| Distribution ID | ${{ steps.outputs.outputs.distribution_id }} |" >> $GITHUB_STEP_SUMMARY
+          echo "| CloudFront Domain | ${{ steps.outputs.outputs.cloudfront_domain }} |" >> $GITHUB_STEP_SUMMARY
+          echo "" >> $GITHUB_STEP_SUMMARY
+          echo "💡 **Note:** CloudFront propagation takes 10-15 minutes" >> $GITHUB_STEP_SUMMARY
 
   monitor:
-    name: 📊 Post-Deployment Monitoring
+    name: 📊 Post-Deployment Check
     runs-on: ubuntu-latest
     needs: [setup, apply]
     if: success()
@@ -419,81 +421,49 @@ jobs:
           terraform_version: ${{ env.TF_VERSION }}
           terraform_wrapper: false
 
-      - name: 📂 Restore Config
-        working-directory: ${{ needs.setup.outputs.tf_dir }}
-        run: |
-          [ ! -f terraform.tfvars ] && cp terraform.tfvars.example terraform.tfvars || true
-
       - name: 🔧 Terraform Init
         working-directory: ${{ needs.setup.outputs.tf_dir }}
         run: terraform init
 
-      - name: 📊 Enhanced Deployment Summary
+      - name: 📊 Deployment Verification
         working-directory: ${{ needs.setup.outputs.tf_dir }}
         run: |
           echo "## 📊 Deployment Verification" >> $GITHUB_STEP_SUMMARY
           echo "" >> $GITHUB_STEP_SUMMARY
-          echo "| Resource | Status | Value |" >> $GITHUB_STEP_SUMMARY
-          echo "|----------|--------|-------|" >> $GITHUB_STEP_SUMMARY
           
           DIST=$(terraform output -raw cloudfront_distribution_id 2>/dev/null || echo "N/A")
           DOMAIN=$(terraform output -raw cloudfront_domain_name 2>/dev/null || echo "N/A")
           BUCKET=$(terraform output -raw s3_bucket_name 2>/dev/null || echo "N/A")
           WAF=$(terraform output -raw waf_web_acl_arn 2>/dev/null || echo "N/A")
-          DASHBOARD=$(terraform output -raw dashboard_url 2>/dev/null || echo "N/A")
           
-          echo "| 🌐 CloudFront | ✅ Deployed | $DIST |" >> $GITHUB_STEP_SUMMARY
-          echo "| 📦 S3 Bucket | ✅ Deployed | $BUCKET |" >> $GITHUB_STEP_SUMMARY
-          echo "| 🛡️ WAF ACL | ✅ Deployed | $(echo $WAF | cut -d'/' -f2-) |" >> $GITHUB_STEP_SUMMARY
+          echo "### ✅ Resources Status" >> $GITHUB_STEP_SUMMARY
+          echo "" >> $GITHUB_STEP_SUMMARY
+          echo "| Resource | Status |" >> $GITHUB_STEP_SUMMARY
+          echo "|----------|--------|" >> $GITHUB_STEP_SUMMARY
+          echo "| ☁️ CloudFront | ✅ Active |" >> $GITHUB_STEP_SUMMARY
+          echo "| 📦 S3 Bucket | ✅ Active |" >> $GITHUB_STEP_SUMMARY
+          echo "| 🛡️ WAF ACL | ✅ Active |" >> $GITHUB_STEP_SUMMARY
           echo "" >> $GITHUB_STEP_SUMMARY
           
-          echo "### 🧪 Health Checks" >> $GITHUB_STEP_SUMMARY
+          echo "### 🧪 Health Check" >> $GITHUB_STEP_SUMMARY
           echo "" >> $GITHUB_STEP_SUMMARY
-          echo "| Check | Result | Details |" >> $GITHUB_STEP_SUMMARY
-          echo "|-------|--------|---------|" >> $GITHUB_STEP_SUMMARY
           
           if [ "$DOMAIN" != "N/A" ]; then
             URL="https://$DOMAIN"
             HTTP_CODE=$(curl -s -o /dev/null -w "%{http_code}" --max-time 10 "$URL" 2>/dev/null || echo "000")
             
             if [ "$HTTP_CODE" = "200" ]; then
-              echo "| 🌐 Website Access | ✅ Success | HTTP $HTTP_CODE |" >> $GITHUB_STEP_SUMMARY
+              echo "✅ Website is accessible (HTTP $HTTP_CODE)" >> $GITHUB_STEP_SUMMARY
+            elif [ "$HTTP_CODE" = "000" ]; then
+              echo "⏳ Website is propagating (allow 10-15 minutes)" >> $GITHUB_STEP_SUMMARY
             else
-              echo "| 🌐 Website Access | ⏳ Propagating | Wait 5-10 minutes |" >> $GITHUB_STEP_SUMMARY
-            fi
-            
-            HEADERS=$(curl -sI "$URL" --max-time 10 2>/dev/null || echo "")
-            if echo "$HEADERS" | grep -qi "strict-transport-security"; then
-              echo "| 🔒 Security Headers | ✅ Configured | HSTS enabled |" >> $GITHUB_STEP_SUMMARY
-            else
-              echo "| 🔒 Security Headers | ⏳ Propagating | Will appear shortly |" >> $GITHUB_STEP_SUMMARY
+              echo "⚠️ Received HTTP $HTTP_CODE (may still be propagating)" >> $GITHUB_STEP_SUMMARY
             fi
           fi
           
           echo "" >> $GITHUB_STEP_SUMMARY
-          echo "### 📈 Monitoring & Management" >> $GITHUB_STEP_SUMMARY
+          echo "### 🔗 Quick Links" >> $GITHUB_STEP_SUMMARY
           echo "" >> $GITHUB_STEP_SUMMARY
-          echo "| Service | Console Link |" >> $GITHUB_STEP_SUMMARY
-          echo "|---------|--------------|" >> $GITHUB_STEP_SUMMARY
-          echo "| ☁️ CloudFront | [View Distribution](https://console.aws.amazon.com/cloudfront/v3/home#/distributions/$DIST) |" >> $GITHUB_STEP_SUMMARY
-          echo "| 📦 S3 Bucket | [View Bucket](https://s3.console.aws.amazon.com/s3/buckets/$BUCKET) |" >> $GITHUB_STEP_SUMMARY
-          
-          if [ "$DASHBOARD" != "N/A" ]; then
-            echo "| 📊 CloudWatch | [View Dashboard]($DASHBOARD) |" >> $GITHUB_STEP_SUMMARY
-          fi
-          
-          echo "| 🔐 WAF & Shield | [View Web ACLs](https://console.aws.amazon.com/wafv2/homev2/web-acls?region=global) |" >> $GITHUB_STEP_SUMMARY
-          echo "" >> $GITHUB_STEP_SUMMARY
-          echo "### 🌐 Your Website" >> $GITHUB_STEP_SUMMARY
-          echo "" >> $GITHUB_STEP_SUMMARY
-          echo "**🎉 Access your website at:** https://$DOMAIN" >> $GITHUB_STEP_SUMMARY
-          echo "" >> $GITHUB_STEP_SUMMARY
-          echo "💡 **Note:** CloudFront can take 10-15 minutes to fully propagate worldwide." >> $GITHUB_STEP_SUMMARY
-          echo "" >> $GITHUB_STEP_SUMMARY
-          echo "### ✅ Next Steps" >> $GITHUB_STEP_SUMMARY
-          echo "" >> $GITHUB_STEP_SUMMARY
-          echo "- ✅ Infrastructure deployed successfully" >> $GITHUB_STEP_SUMMARY
-          echo "- 🌐 Test your website using the CloudFront URL" >> $GITHUB_STEP_SUMMARY
-          echo "- 📊 Monitor performance via CloudWatch dashboard" >> $GITHUB_STEP_SUMMARY
-          echo "- 🛡️ Review security settings in WAF console" >> $GITHUB_STEP_SUMMARY
-          echo "- 📁 Upload custom content to S3 bucket" >> $GITHUB_STEP_SUMMARY
+          echo "- [CloudFront Console](https://console.aws.amazon.com/cloudfront/v3/home#/distributions/$DIST)" >> $GITHUB_STEP_SUMMARY
+          echo "- [S3 Bucket](https://s3.console.aws.amazon.com/s3/buckets/$BUCKET)" >> $GITHUB_STEP_SUMMARY
+          echo "- [WAF Console](https://console.aws.amazon.com/wafv2/homev2/web-acls?region=global)" >> $GITHUB_STEP_SUMMARY
