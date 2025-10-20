@@ -7,71 +7,29 @@ on:
         description: 'Type "DESTROY" to confirm'
         required: true
         type: string
-      environment:
-        description: 'Environment to destroy'
-        required: true
-        default: 'production'
-        type: choice
-        options:
-          - production
-          - staging
 
 env:
   TF_VERSION: '1.5.0'
   AWS_REGION: 'us-east-1'
-  TF_IN_AUTOMATION: true
-  TF_INPUT: false
 
 permissions:
   contents: read
 
 jobs:
-  validate-destruction:
-    name: ⚠️ Validate Destroy Request
-    runs-on: ubuntu-latest
-    outputs:
-      proceed: ${{ steps.check.outputs.proceed }}
-      tf_dir: ${{ steps.detect.outputs.tf_dir }}
-    
-    steps:
-      - name: 📥 Checkout Code
-        uses: actions/checkout@v4
-
-      - name: ⚠️ Validate Confirmation
-        id: check
-        run: |
-          if [ "${{ github.event.inputs.confirm_destroy }}" = "DESTROY" ]; then
-            echo "✅ Destruction confirmed"
-            echo "proceed=true" >> $GITHUB_OUTPUT
-          else
-            echo "❌ Invalid confirmation. You must type 'DESTROY' exactly."
-            echo "proceed=false" >> $GITHUB_OUTPUT
-            exit 1
-          fi
-
-      - name: 🔍 Detect Terraform Directory
-        id: detect
-        if: steps.check.outputs.proceed == 'true'
-        run: |
-          if [ -f "main.tf" ]; then
-            echo "tf_dir=." >> $GITHUB_OUTPUT
-          elif [ -f "terraform/main.tf" ]; then
-            echo "tf_dir=./terraform" >> $GITHUB_OUTPUT
-          else
-            echo "❌ Cannot find main.tf"
-            exit 1
-          fi
-
   destroy:
     name: 💥 Destroy All Resources
     runs-on: ubuntu-latest
-    needs: validate-destruction
-    if: needs.validate-destruction.outputs.proceed == 'true'
-    environment: 
-      name: ${{ github.event.inputs.environment }}
     
     steps:
-      - name: 📥 Checkout Code
+      - name: ⚠️ Validate Confirmation
+        run: |
+          if [ "${{ github.event.inputs.confirm_destroy }}" != "DESTROY" ]; then
+            echo "❌ You must type DESTROY exactly"
+            exit 1
+          fi
+          echo "✅ Confirmation validated"
+
+      - name: 📥 Checkout
         uses: actions/checkout@v4
 
       - name: 🔧 Setup Terraform
@@ -80,137 +38,109 @@ jobs:
           terraform_version: ${{ env.TF_VERSION }}
           terraform_wrapper: false
 
-      - name: 🔐 Configure AWS Credentials
+      - name: 🔐 Configure AWS
         uses: aws-actions/configure-aws-credentials@v4
         with:
           aws-access-key-id: ${{ secrets.AWS_ACCESS_KEY_ID }}
           aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
           aws-region: ${{ env.AWS_REGION }}
 
-      - name: 📂 Prepare Configuration
-        working-directory: ${{ needs.validate-destruction.outputs.tf_dir }}
+      - name: 🔍 Detect Directory
+        id: detect
+        run: |
+          if [ -f "main.tf" ]; then
+            echo "dir=." >> $GITHUB_OUTPUT
+          elif [ -f "terraform/main.tf" ]; then
+            echo "dir=terraform" >> $GITHUB_OUTPUT
+          else
+            echo "❌ Cannot find main.tf"
+            exit 1
+          fi
+
+      - name: 📂 Prepare Config
+        working-directory: ${{ steps.detect.outputs.dir }}
         run: |
           if [ ! -f terraform.tfvars ]; then
-            if [ -f terraform.tfvars.example ]; then
-              cp terraform.tfvars.example terraform.tfvars
-            else
-              cat > terraform.tfvars << 'EOF'
+            cat > terraform.tfvars << 'EOF'
           use_custom_domain = false
           domain_name       = ""
           project_name      = "secure-website"
-          environment       = "${{ github.event.inputs.environment }}"
+          environment       = "production"
           allowed_countries = ["US", "CA", "GB"]
           EOF
-            fi
           fi
 
-      - name: 🔧 Terraform Init
-        working-directory: ${{ needs.validate-destruction.outputs.tf_dir }}
+      - name: 🔧 Init
+        working-directory: ${{ steps.detect.outputs.dir }}
         run: terraform init
 
-      - name: 📋 Show What Will Be Destroyed
-        working-directory: ${{ needs.validate-destruction.outputs.tf_dir }}
+      - name: 📋 List Resources
+        working-directory: ${{ steps.detect.outputs.dir }}
         run: |
           echo "## 💥 Resources to be Destroyed" >> $GITHUB_STEP_SUMMARY
           echo "" >> $GITHUB_STEP_SUMMARY
           
-          # Get resource info before destroying
-          BUCKET=$(terraform output -raw s3_bucket_name 2>/dev/null || echo "N/A")
-          LOGS_BUCKET=$(terraform output -raw logs_bucket_name 2>/dev/null || echo "N/A")
-          DIST_ID=$(terraform output -raw cloudfront_distribution_id 2>/dev/null || echo "N/A")
+          WB=$(terraform output -raw s3_bucket_name 2>/dev/null || echo "N/A")
+          LB=$(terraform output -raw logs_bucket_name 2>/dev/null || echo "N/A")
+          DIST=$(terraform output -raw cloudfront_distribution_id 2>/dev/null || echo "N/A")
           
-          echo "| Resource Type | Name |" >> $GITHUB_STEP_SUMMARY
-          echo "|---------------|------|" >> $GITHUB_STEP_SUMMARY
-          echo "| S3 Bucket | $BUCKET |" >> $GITHUB_STEP_SUMMARY
-          echo "| Logs Bucket | $LOGS_BUCKET |" >> $GITHUB_STEP_SUMMARY
-          echo "| CloudFront Distribution | $DIST_ID |" >> $GITHUB_STEP_SUMMARY
-          echo "| WAF Web ACL | secure-website-waf |" >> $GITHUB_STEP_SUMMARY
-          echo "| CloudWatch Dashboard | secure-website-dashboard |" >> $GITHUB_STEP_SUMMARY
+          echo "| Resource | Name |" >> $GITHUB_STEP_SUMMARY
+          echo "|----------|------|" >> $GITHUB_STEP_SUMMARY
+          echo "| Website Bucket | $WB |" >> $GITHUB_STEP_SUMMARY
+          echo "| Logs Bucket | $LB |" >> $GITHUB_STEP_SUMMARY
+          echo "| CloudFront | $DIST |" >> $GITHUB_STEP_SUMMARY
+          echo "| WAF | Will be removed |" >> $GITHUB_STEP_SUMMARY
           echo "" >> $GITHUB_STEP_SUMMARY
 
       - name: 🗑️ Empty S3 Buckets
-        working-directory: ${{ needs.validate-destruction.outputs.tf_dir }}
+        working-directory: ${{ steps.detect.outputs.dir }}
         run: |
           echo "🗑️ Emptying S3 buckets..."
           
-          # Get bucket names
-          WEBSITE_BUCKET=$(terraform output -raw s3_bucket_name 2>/dev/null || echo "")
-          LOGS_BUCKET=$(terraform output -raw logs_bucket_name 2>/dev/null || echo "")
+          WB=$(terraform output -raw s3_bucket_name 2>/dev/null || echo "")
+          LB=$(terraform output -raw logs_bucket_name 2>/dev/null || echo "")
           
-          # Empty website bucket
-          if [ -n "$WEBSITE_BUCKET" ] && [ "$WEBSITE_BUCKET" != "N/A" ]; then
-            echo "Emptying website bucket: $WEBSITE_BUCKET"
-            aws s3 rm s3://$WEBSITE_BUCKET --recursive || true
-            
-            # Remove all versions if versioned
-            aws s3api list-object-versions \
-              --bucket $WEBSITE_BUCKET \
-              --output json \
-              --query 'Versions[].{Key:Key,VersionId:VersionId}' 2>/dev/null | \
-            jq -r '.[] | "--key \(.Key) --version-id \(.VersionId)"' | \
-            xargs -I {} aws s3api delete-object --bucket $WEBSITE_BUCKET {} || true
-            
-            # Remove delete markers
-            aws s3api list-object-versions \
-              --bucket $WEBSITE_BUCKET \
-              --output json \
-              --query 'DeleteMarkers[].{Key:Key,VersionId:VersionId}' 2>/dev/null | \
-            jq -r '.[] | "--key \(.Key) --version-id \(.VersionId)"' | \
-            xargs -I {} aws s3api delete-object --bucket $WEBSITE_BUCKET {} || true
-          fi
+          empty_bucket() {
+            local bucket=$1
+            if [ -n "$bucket" ] && [ "$bucket" != "N/A" ]; then
+              echo "  Emptying: $bucket"
+              aws s3 rm s3://$bucket --recursive || true
+              
+              # Delete versions
+              aws s3api list-object-versions --bucket $bucket --output json 2>/dev/null | \
+              jq -r '.Versions[]? | "--key \"" + .Key + "\" --version-id \"" + .VersionId + "\""' | \
+              xargs -I {} sh -c "aws s3api delete-object --bucket $bucket {} || true"
+              
+              # Delete markers
+              aws s3api list-object-versions --bucket $bucket --output json 2>/dev/null | \
+              jq -r '.DeleteMarkers[]? | "--key \"" + .Key + "\" --version-id \"" + .VersionId + "\""' | \
+              xargs -I {} sh -c "aws s3api delete-object --bucket $bucket {} || true"
+            fi
+          }
           
-          # Empty logs bucket
-          if [ -n "$LOGS_BUCKET" ] && [ "$LOGS_BUCKET" != "N/A" ]; then
-            echo "Emptying logs bucket: $LOGS_BUCKET"
-            aws s3 rm s3://$LOGS_BUCKET --recursive || true
-            
-            # Remove all versions if versioned
-            aws s3api list-object-versions \
-              --bucket $LOGS_BUCKET \
-              --output json \
-              --query 'Versions[].{Key:Key,VersionId:VersionId}' 2>/dev/null | \
-            jq -r '.[] | "--key \(.Key) --version-id \(.VersionId)"' | \
-            xargs -I {} aws s3api delete-object --bucket $LOGS_BUCKET {} || true
-          fi
+          empty_bucket "$WB"
+          empty_bucket "$LB"
           
           echo "✅ Buckets emptied"
 
       - name: 💥 Terraform Destroy
-        working-directory: ${{ needs.validate-destruction.outputs.tf_dir }}
+        working-directory: ${{ steps.detect.outputs.dir }}
         run: |
-          echo "💥 Starting infrastructure destruction..."
+          echo "💥 Destroying infrastructure..."
           terraform destroy -auto-approve
           echo "✅ Destruction complete"
 
-      - name: 🧹 Cleanup State
-        working-directory: ${{ needs.validate-destruction.outputs.tf_dir }}
-        continue-on-error: true
+      - name: 📊 Summary
         run: |
-          # Remove local state files (if not using remote backend)
-          rm -f terraform.tfstate*
-          rm -f .terraform.lock.hcl
-          rm -rf .terraform/
-          echo "✅ Local state cleaned"
-
-      - name: 📊 Destruction Summary
-        run: |
-          echo "## ✅ Infrastructure Destroyed" >> $GITHUB_STEP_SUMMARY
-          echo "" >> $GITHUB_STEP_SUMMARY
-          echo "All resources have been successfully destroyed:" >> $GITHUB_STEP_SUMMARY
-          echo "" >> $GITHUB_STEP_SUMMARY
-          echo "- ✅ S3 Buckets emptied and deleted" >> $GITHUB_STEP_SUMMARY
-          echo "- ✅ CloudFront Distribution deleted" >> $GITHUB_STEP_SUMMARY
-          echo "- ✅ WAF Web ACL deleted" >> $GITHUB_STEP_SUMMARY
-          echo "- ✅ CloudWatch resources deleted" >> $GITHUB_STEP_SUMMARY
-          echo "- ✅ All associated resources cleaned up" >> $GITHUB_STEP_SUMMARY
-          echo "" >> $GITHUB_STEP_SUMMARY
-          echo "**Environment:** ${{ github.event.inputs.environment }}" >> $GITHUB_STEP_SUMMARY
-          echo "**Destroyed at:** $(date -u '+%Y-%m-%d %H:%M:%S UTC')" >> $GITHUB_STEP_SUMMARY
-          echo "" >> $GITHUB_STEP_SUMMARY
-          echo "You can redeploy anytime using the Deploy Infrastructure workflow." >> $GITHUB_STEP_SUMMARY
-
-      - name: 🔔 Notify Completion
-        run: |
-          echo "🎉 Destruction completed successfully!"
-          echo "Environment: ${{ github.event.inputs.environment }}"
-          echo "All AWS resources have been removed."
+          cat >> $GITHUB_STEP_SUMMARY << EOF
+          ## ✅ Infrastructure Destroyed
+          
+          All resources have been successfully removed:
+          
+          - ✅ S3 Buckets deleted
+          - ✅ CloudFront Distribution deleted
+          - ✅ WAF Web ACL deleted
+          - ✅ CloudWatch Dashboard deleted
+          
+          You can redeploy anytime by pushing to main branch.
+          EOF
