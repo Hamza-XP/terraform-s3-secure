@@ -53,17 +53,13 @@ data "aws_region" "current" {}
 # ============================================================================
 
 resource "aws_s3_bucket" "website" {
-  bucket = "${var.project_name}-${var.environment}-${random_id.bucket_suffix.hex}"
+  bucket = "${var.project_name}-${var.environment}-website"
 
   tags = {
     Name        = "${var.project_name}-website"
     Environment = var.environment
     Purpose     = "Static Website Hosting"
   }
-}
-
-resource "random_id" "bucket_suffix" {
-  byte_length = 4
 }
 
 resource "aws_s3_bucket_versioning" "website" {
@@ -97,7 +93,7 @@ resource "aws_s3_bucket_public_access_block" "website" {
 # ============================================================================
 
 resource "aws_s3_bucket" "logs" {
-  bucket = "${var.project_name}-${var.environment}-logs-${random_id.bucket_suffix.hex}"
+  bucket = "${var.project_name}-${var.environment}-logs"
 
   tags = {
     Name        = "${var.project_name}-logs"
@@ -188,7 +184,7 @@ resource "aws_s3_bucket_lifecycle_configuration" "logs" {
 # ============================================================================
 
 resource "aws_cloudwatch_log_group" "waf_logs" {
-  name              = "aws-waf-logs-${var.project_name}-${var.environment}-${random_id.bucket_suffix.hex}"
+  name              = "aws-waf-logs-${var.project_name}-${var.environment}"
   retention_in_days = 30
 
   tags = {
@@ -217,7 +213,7 @@ resource "aws_s3_bucket_acl" "logs" {
 # ============================================================================
 
 resource "aws_iam_role" "firehose_delivery_role" {
-  name = "${var.project_name}-${var.environment}-firehose-role-${random_id.bucket_suffix.hex}"
+  name = "${var.project_name}-${var.environment}-firehose-role"
 
   assume_role_policy = jsonencode({
     Version = "2012-10-17"
@@ -239,7 +235,7 @@ resource "aws_iam_role" "firehose_delivery_role" {
 }
 
 resource "aws_iam_role_policy" "firehose_delivery_policy" {
-  name = "${var.project_name}-${var.environment}-firehose-policy-${random_id.bucket_suffix.hex}"
+  name = "${var.project_name}-${var.environment}-firehose-policy"
   role = aws_iam_role.firehose_delivery_role.id
 
   policy = jsonencode({
@@ -272,7 +268,7 @@ resource "aws_iam_role_policy" "firehose_delivery_policy" {
 }
 
 resource "aws_kinesis_firehose_delivery_stream" "waf_logs" {
-  name        = "aws-waf-logs-${var.project_name}-${var.environment}-${random_id.bucket_suffix.hex}"
+  name        = "aws-waf-logs-${var.project_name}-${var.environment}"
   destination = "extended_s3"
 
   extended_s3_configuration {
@@ -369,8 +365,7 @@ resource "aws_acm_certificate" "website" {
 # ============================================================================
 
 resource "aws_cloudfront_origin_access_control" "website" {
-  # FIXED: Added random suffix to prevent naming conflicts
-  name                              = "${var.project_name}-oac-${random_id.bucket_suffix.hex}"
+  name                              = "${var.project_name}-${var.environment}-oac"
   description                       = "OAC for ${var.project_name} website"
   origin_access_control_origin_type = "s3"
   signing_behavior                  = "always"
@@ -616,8 +611,7 @@ resource "aws_cloudfront_distribution" "website" {
 # ============================================================================
 
 resource "aws_cloudfront_response_headers_policy" "security_headers" {
-  # FIXED: Added random suffix to prevent naming conflicts
-  name = "${var.project_name}-security-headers-${random_id.bucket_suffix.hex}"
+  name = "${var.project_name}-${var.environment}-security-headers"
 
   security_headers_config {
     strict_transport_security {
