@@ -523,7 +523,7 @@ jobs:
               else
                 echo "  🗑️  Orphaned: $waf_name"
                 # Now it should be deletable since CloudFront distributions are gone
-                aws wafv2 delete-web-acl --scope CLOUDFRONT --id "$waf_id" --lock-token "$lock_token" --region us-east-1 2>&1 && \
+                aws wafv2 delete-web-acl --name "$waf_name" --scope CLOUDFRONT --id "$waf_id" --lock-token "$lock_token" --region us-east-1
                 echo "     ✅ Deleted" || echo "     ⚠️  Failed to delete"
               fi
             fi
@@ -733,17 +733,50 @@ jobs:
           echo "🛡️  WAF Web ACL:"
           WAF_JSON=$(aws wafv2 list-web-acls --scope CLOUDFRONT --region us-east-1 --output json 2>/dev/null || echo '{"WebACLs":[]}')
           WAF_ID=$(echo "$WAF_JSON" | jq -r ".WebACLs[] | select(.Name==\"${PREFIX}-waf\") | .Id" 2>/dev/null)
-          
+
           if [ -n "$WAF_ID" ] && [ "$WAF_ID" != "null" ]; then
             WAF_IMPORT_ID="${WAF_ID}/${PREFIX}-waf/CLOUDFRONT"
             
             if ! smart_import "$WAF_RESOURCE" "$WAF_IMPORT_ID" "WAF Web ACL"; then
-              # [KEEP YOUR EXISTING WAF CLEANUP CODE HERE]
+              # Import failed - delete and recreate
+              echo "  🔄 Import failed - removing duplicate WAF..."
+              LOCK_TOKEN=$(echo "$WAF_JSON" | jq -r ".WebACLs[] | select(.Name==\"${PREFIX}-waf\") | .LockToken")
+              
+              if [ -n "$LOCK_TOKEN" ]; then
+                # Check if attached to CloudFront
+                ATTACHED=$(aws cloudfront list-distributions --output json 2>/dev/null | \
+                          jq -r ".DistributionList.Items[]? | select(.WebACLId | contains(\"$WAF_ID\")) | .Id" | head -1)
+                
+                if [ -n "$ATTACHED" ]; then
+                  echo "  🔄 Detaching from CloudFront $ATTACHED..."
+                  aws cloudfront get-distribution-config --id "$ATTACHED" > /tmp/dist_waf.json
+                  DIST_ETAG=$(cat /tmp/dist_waf.json | jq -r '.ETag')
+                  
+                  cat /tmp/dist_waf.json | jq '.DistributionConfig.WebACLId = ""' > /tmp/dist_no_waf.json
+                  
+                  aws cloudfront update-distribution \
+                    --id "$ATTACHED" \
+                    --if-match "$DIST_ETAG" \
+                    --distribution-config "$(cat /tmp/dist_no_waf.json | jq -c '.DistributionConfig')" 2>/dev/null || true
+                  
+                  sleep 5
+                fi
+                
+                echo "  🗑️  Deleting duplicate WAF..."
+                aws wafv2 delete-web-acl \
+                  --name "${PREFIX}-waf" \
+                  --scope CLOUDFRONT \
+                  --id "$WAF_ID" \
+                  --lock-token "$LOCK_TOKEN" \
+                  --region us-east-1 2>&1 && \
+                echo "  ✅ Deleted - Terraform will create new one" || \
+                echo "  ⚠️  Could not delete"
+              fi
             fi
           else
             echo "  ℹ️  WAF not found (will be created)"
           fi
-          
+
           # Import CloudFront
           echo ""
           echo "☁️  CloudFront Distribution:"
