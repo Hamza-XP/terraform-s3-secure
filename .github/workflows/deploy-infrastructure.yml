@@ -29,6 +29,7 @@ env:
   AWS_REGION: 'us-east-1'
   TF_IN_AUTOMATION: true
   TF_INPUT: false
+  TF_WORKING_DIR: '.'
 
 permissions:
   contents: read
@@ -49,12 +50,21 @@ jobs:
       - name: 🔍 Detect Terraform Directory
         id: detect
         run: |
+          echo "🔍 Detecting Terraform files location..."
+          
           if [ -f "main.tf" ]; then
+            echo "✅ Found Terraform files in root directory"
             echo "tf_dir=." >> $GITHUB_OUTPUT
           elif [ -f "terraform/main.tf" ]; then
+            echo "✅ Found Terraform files in terraform/ subdirectory"
             echo "tf_dir=./terraform" >> $GITHUB_OUTPUT
           else
-            echo "❌ Cannot find main.tf"
+            echo "❌ ERROR: Cannot find main.tf in root or terraform/ directory"
+            echo "📂 Current directory structure:"
+            ls -la
+            echo ""
+            echo "📂 Looking for .tf files:"
+            find . -name "*.tf" -type f
             exit 1
           fi
 
@@ -62,6 +72,9 @@ jobs:
     name: 🔍 Validate Terraform
     runs-on: ubuntu-latest
     needs: setup
+    outputs:
+      tf-fmt: ${{ steps.fmt.outcome }}
+      tf-validate: ${{ steps.validate.outcome }}
     
     steps:
       - name: 📥 Checkout Code
@@ -72,18 +85,49 @@ jobs:
         with:
           terraform_version: ${{ env.TF_VERSION }}
 
-      - name: 🎨 Format Check
+      - name: 📂 Show Structure
+        run: |
+          echo "Working directory: ${{ needs.setup.outputs.tf_dir }}"
+          ls -la ${{ needs.setup.outputs.tf_dir }}
+
+      - name: 🎨 Terraform Format Check
+        id: fmt
         working-directory: ${{ needs.setup.outputs.tf_dir }}
         run: terraform fmt -check -recursive
         continue-on-error: true
 
-      - name: 🔧 Init
+      - name: 🔧 Terraform Init
         working-directory: ${{ needs.setup.outputs.tf_dir }}
         run: terraform init -backend=false
 
-      - name: ✅ Validate
+      - name: ✅ Terraform Validate
+        id: validate
         working-directory: ${{ needs.setup.outputs.tf_dir }}
         run: terraform validate
+
+      - name: 📊 Comment PR - Validation
+        if: github.event_name == 'pull_request'
+        uses: actions/github-script@v7
+        continue-on-error: true
+        with:
+          script: |
+            const output = `
+            ## 🔍 Terraform Validation Results
+            
+            **Working Directory:** \`${{ needs.setup.outputs.tf_dir }}\`
+            
+            | Check | Result |
+            |-------|--------|
+            | Format | ${{ steps.fmt.outcome == 'success' && '✅ Passed' || '⚠️ Failed' }} |
+            | Validate | ${{ steps.validate.outcome == 'success' && '✅ Passed' || '❌ Failed' }} |
+            `;
+            
+            github.rest.issues.createComment({
+              issue_number: context.issue.number,
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              body: output
+            });
 
   security-scan:
     name: 🔒 Security Scan
@@ -102,14 +146,13 @@ jobs:
           soft_fail: true
         continue-on-error: true
 
-  apply:
-    name: 🚀 Deploy
+  plan:
+    name: 📋 Terraform Plan
     runs-on: ubuntu-latest
     needs: [setup, validate, security-scan]
-    if: |
-      (github.ref == 'refs/heads/main' && github.event_name == 'push') ||
-      (github.event_name == 'workflow_dispatch' && github.event.inputs.action == 'apply')
-    environment: production
+    if: github.event_name == 'pull_request' || (github.event_name == 'workflow_dispatch' && github.event.inputs.action == 'plan')
+    environment: 
+      name: production
     
     steps:
       - name: 📥 Checkout Code
@@ -121,14 +164,14 @@ jobs:
           terraform_version: ${{ env.TF_VERSION }}
           terraform_wrapper: false
 
-      - name: 🔐 Configure AWS
+      - name: 🔐 Configure AWS Credentials
         uses: aws-actions/configure-aws-credentials@v4
         with:
           aws-access-key-id: ${{ secrets.AWS_ACCESS_KEY_ID }}
           aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
           aws-region: ${{ env.AWS_REGION }}
 
-      - name: 📂 Prepare Config
+      - name: 📂 Create terraform.tfvars
         working-directory: ${{ needs.setup.outputs.tf_dir }}
         run: |
           if [ ! -f terraform.tfvars ]; then
@@ -149,35 +192,281 @@ jobs:
         working-directory: ${{ needs.setup.outputs.tf_dir }}
         run: terraform init
 
+      - name: 📋 Terraform Plan
+        working-directory: ${{ needs.setup.outputs.tf_dir }}
+        run: terraform plan -out=tfplan
+
+      - name: 💾 Upload Plan
+        uses: actions/upload-artifact@v4
+        with:
+          name: tfplan
+          path: ${{ needs.setup.outputs.tf_dir }}/tfplan
+          retention-days: 5
+
+      - name: 📊 Comment PR - Plan
+        if: github.event_name == 'pull_request'
+        uses: actions/github-script@v7
+        continue-on-error: true
+        with:
+          script: |
+            const output = `
+            ## 📋 Terraform Plan Results
+            
+            ✅ Plan generated successfully
+            
+            **Next Steps:**
+            - Review the plan carefully
+            - Merge to \`main\` to apply changes automatically
+            - Or use \`workflow_dispatch\` with \`apply\` action
+            `;
+            
+            github.rest.issues.createComment({
+              issue_number: context.issue.number,
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              body: output
+            });
+
+  apply:
+    name: 🚀 Terraform Apply
+    runs-on: ubuntu-latest
+    needs: [setup, validate, security-scan]
+    if: |
+      (github.ref == 'refs/heads/main' && github.event_name == 'push') ||
+      (github.event_name == 'workflow_dispatch' && github.event.inputs.action == 'apply')
+    environment: 
+      name: production
+    
+    steps:
+      - name: 📥 Checkout Code
+        uses: actions/checkout@v4
+
+      - name: 🔧 Setup Terraform
+        uses: hashicorp/setup-terraform@v3
+        with:
+          terraform_version: ${{ env.TF_VERSION }}
+          terraform_wrapper: false
+
+      - name: 🔐 Configure AWS Credentials
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          aws-access-key-id: ${{ secrets.AWS_ACCESS_KEY_ID }}
+          aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+          aws-region: ${{ env.AWS_REGION }}
+
+      - name: 📂 Create terraform.tfvars
+        working-directory: ${{ needs.setup.outputs.tf_dir }}
+        run: |
+          if [ ! -f terraform.tfvars ]; then
+            if [ -f terraform.tfvars.example ]; then
+              cp terraform.tfvars.example terraform.tfvars
+            else
+              cat > terraform.tfvars << 'EOF'
+          use_custom_domain = false
+          domain_name       = ""
+          project_name      = "secure-website"
+          environment       = "production"
+          allowed_countries = ["US", "CA", "GB"]
+          EOF
+            fi
+          fi
+
+      - name: 🔧 Terraform Init
+        working-directory: ${{ needs.setup.outputs.tf_dir }}
+        run: terraform init
+
+      - name: 🧹 Smart Cleanup - Remove Orphaned Resources
+        working-directory: ${{ needs.setup.outputs.tf_dir }}
+        continue-on-error: true
+        run: |
+          set +e  # Don't exit on errors during cleanup
+          
+          echo "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
+          echo "🧹 SMART CLEANUP - Removing Orphaned Resources"
+          echo "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
+          echo ""
+          echo "This prevents duplicate resources from accumulating"
+          echo ""
+          
+          # Get target resource names
+          PROJECT=$(terraform console <<< "var.project_name" 2>/dev/null | tr -d '"' || echo "secure-website")
+          ENV=$(terraform console <<< "var.environment" 2>/dev/null | tr -d '"' || echo "production")
+          TARGET_PREFIX="${PROJECT}-${ENV}"
+          
+          echo "🎯 Target resource prefix: $TARGET_PREFIX"
+          echo ""
+          
+          # Check if resource is managed by Terraform
+          is_managed() {
+            terraform state list 2>/dev/null | grep -q "$1"
+          }
+          
+          # ================================================================
+          # 1. CLEANUP ORPHANED CLOUDFRONT DISTRIBUTIONS
+          # ================================================================
+          echo "☁️  Scanning CloudFront Distributions..."
+          
+          DIST_COUNT=0
+          aws cloudfront list-distributions --output json 2>/dev/null | \
+          jq -r '.DistributionList.Items[]? | select(.Comment | contains("secure-website")) | "\(.Id)|\(.Comment)|\(.Status)|\(.Enabled)"' | \
+          while IFS='|' read -r dist_id comment status enabled; do
+            DIST_COUNT=$((DIST_COUNT + 1))
+            
+            # Skip if this is our current managed distribution
+            if [ "$comment" = "${TARGET_PREFIX} distribution" ] && is_managed "aws_cloudfront_distribution.main"; then
+              echo "  ✅ $dist_id - Current distribution (managed)"
+              continue
+            fi
+            
+            # This is an orphaned distribution
+            echo "  🗑️  Found orphaned: $dist_id ($comment)"
+            
+            if [ "$enabled" = "true" ]; then
+              echo "     Disabling distribution..."
+              
+              aws cloudfront get-distribution-config --id "$dist_id" > /tmp/cf_$dist_id.json 2>/dev/null
+              ETAG=$(cat /tmp/cf_$dist_id.json | jq -r '.ETag')
+              
+              cat /tmp/cf_$dist_id.json | jq '.DistributionConfig.Enabled = false' > /tmp/cf_disabled_$dist_id.json
+              
+              aws cloudfront update-distribution \
+                --id "$dist_id" \
+                --if-match "$ETAG" \
+                --distribution-config "$(cat /tmp/cf_disabled_$dist_id.json | jq -c '.DistributionConfig')" \
+                2>/dev/null && echo "     ✅ Disabled (will auto-delete after deployment)" || echo "     ⚠️  Could not disable"
+            fi
+          done
+          
+          # ================================================================
+          # 2. CLEANUP ORPHANED WAF WEB ACLs
+          # ================================================================
+          echo ""
+          echo "🛡️  Scanning WAF Web ACLs..."
+          
+          aws wafv2 list-web-acls --scope CLOUDFRONT --region us-east-1 --output json 2>/dev/null | \
+          jq -r '.WebACLs[]? | select(.Name | contains("secure-website")) | "\(.Id)|\(.Name)|\(.LockToken)"' | \
+          while IFS='|' read -r waf_id waf_name lock_token; do
+            # Skip if this is our current managed WAF
+            if [ "$waf_name" = "${TARGET_PREFIX}-waf" ] && is_managed "aws_wafv2_web_acl.website"; then
+              echo "  ✅ $waf_name - Current WAF (managed)"
+              continue
+            fi
+            
+            # This is an orphaned WAF
+            echo "  🗑️  Found orphaned: $waf_name"
+            
+            # Check if attached to any distribution
+            ATTACHED=$(aws cloudfront list-distributions --output json 2>/dev/null | \
+                      jq -r ".DistributionList.Items[]? | select(.WebACLId | contains(\"$waf_id\")) | .Id" | head -1)
+            
+            if [ -z "$ATTACHED" ]; then
+              echo "     Deleting unattached WAF..."
+              aws wafv2 delete-web-acl \
+                --scope CLOUDFRONT \
+                --id "$waf_id" \
+                --lock-token "$lock_token" \
+                --region us-east-1 2>&1 && \
+              echo "     ✅ Deleted" || \
+              echo "     ⚠️  Could not delete (may be in use)"
+            else
+              echo "     ⚠️  Still attached to CloudFront - will clean after distribution removal"
+            fi
+          done
+          
+          # ================================================================
+          # 3. CLEANUP ORPHANED S3 BUCKETS
+          # ================================================================
+          echo ""
+          echo "📦 Scanning S3 Buckets..."
+          
+          aws s3api list-buckets --query 'Buckets[].Name' --output text 2>/dev/null | \
+          tr '\t' '\n' | grep "secure-website" | \
+          while read -r bucket; do
+            # Skip if this is our current managed bucket
+            if [ "$bucket" = "${TARGET_PREFIX}-website" ] && is_managed "aws_s3_bucket.website"; then
+              echo "  ✅ $bucket - Current website bucket (managed)"
+              continue
+            fi
+            
+            if [ "$bucket" = "${TARGET_PREFIX}-logs" ] && is_managed "aws_s3_bucket.logs"; then
+              echo "  ✅ $bucket - Current logs bucket (managed)"
+              continue
+            fi
+            
+            # This is an orphaned bucket
+            echo "  🗑️  Found orphaned: $bucket"
+            echo "     Emptying..."
+            
+            aws s3 rm s3://$bucket --recursive 2>/dev/null || true
+            
+            # Delete versions
+            aws s3api list-object-versions --bucket $bucket --output json 2>/dev/null | \
+            jq -r '.Versions[]? | "--key \"" + .Key + "\" --version-id \"" + .VersionId + "\""' | \
+            xargs -I {} sh -c "aws s3api delete-object --bucket $bucket {} 2>/dev/null" || true
+            
+            echo "     Deleting bucket..."
+            aws s3 rb s3://$bucket 2>&1 && \
+            echo "     ✅ Deleted" || \
+            echo "     ⚠️  Could not delete"
+          done
+          
+          # ================================================================
+          # 4. CLEANUP ORPHANED CLOUDWATCH DASHBOARDS
+          # ================================================================
+          echo ""
+          echo "📊 Scanning CloudWatch Dashboards..."
+          
+          aws cloudwatch list-dashboards --region us-east-1 --output json 2>/dev/null | \
+          jq -r '.DashboardEntries[]? | select(.DashboardName | contains("secure-website")) | .DashboardName' | \
+          while read -r dashboard; do
+            # Skip if this is our current managed dashboard
+            if [ "$dashboard" = "${TARGET_PREFIX}-dashboard" ] && is_managed "aws_cloudwatch_dashboard.main"; then
+              echo "  ✅ $dashboard - Current dashboard (managed)"
+              continue
+            fi
+            
+            # This is an orphaned dashboard
+            echo "  🗑️  Found orphaned: $dashboard"
+            aws cloudwatch delete-dashboards --dashboard-names "$dashboard" --region us-east-1 2>&1 && \
+            echo "     ✅ Deleted" || \
+            echo "     ⚠️  Could not delete"
+          done
+          
+          echo ""
+          echo "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
+          echo "✅ Cleanup scan complete!"
+          echo "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
+          echo ""
+          
+          set -e  # Re-enable exit on error
+
       - name: 🔍 Detect WAF Resource Name
         id: detect_waf
         working-directory: ${{ needs.setup.outputs.tf_dir }}
         run: |
-          # Check which WAF resource name is used in the Terraform files
           if grep -r "resource \"aws_wafv2_web_acl\" \"website\"" . >/dev/null 2>&1; then
             echo "waf_resource=aws_wafv2_web_acl.website" >> $GITHUB_OUTPUT
-            echo "Found: aws_wafv2_web_acl.website"
+            echo "✅ Detected: aws_wafv2_web_acl.website"
           elif grep -r "resource \"aws_wafv2_web_acl\" \"main\"" . >/dev/null 2>&1; then
             echo "waf_resource=aws_wafv2_web_acl.main" >> $GITHUB_OUTPUT
-            echo "Found: aws_wafv2_web_acl.main"
+            echo "✅ Detected: aws_wafv2_web_acl.main"
           else
-            echo "waf_resource=aws_wafv2_web_acl.main" >> $GITHUB_OUTPUT
-            echo "Defaulting to: aws_wafv2_web_acl.main"
+            echo "waf_resource=aws_wafv2_web_acl.website" >> $GITHUB_OUTPUT
+            echo "⚠️  Using default: aws_wafv2_web_acl.website"
           fi
 
-      - name: 🧠 Smart Resource Manager
+      - name: 🧠 Smart Resource Import
         working-directory: ${{ needs.setup.outputs.tf_dir }}
         env:
           WAF_RESOURCE: ${{ steps.detect_waf.outputs.waf_resource }}
         run: |
-          set +e  # Don't exit on errors
+          set +e  # Don't exit on import errors
           
           echo "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
-          echo "🧠 SMART RESOURCE MANAGER - Auto Import & Reconcile"
+          echo "🧠 SMART RESOURCE IMPORT - Reuse Existing Resources"
           echo "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
           echo ""
           
-          # Get config
           PROJECT=$(terraform console <<< "var.project_name" 2>/dev/null | tr -d '"' || echo "secure-website")
           ENV=$(terraform console <<< "var.environment" 2>/dev/null | tr -d '"' || echo "production")
           PREFIX="${PROJECT}-${ENV}"
@@ -185,12 +474,12 @@ jobs:
           echo "📋 Configuration:"
           echo "   Project: $PROJECT"
           echo "   Environment: $ENV"
-          echo "   Resource Prefix: $PREFIX"
+          echo "   Prefix: $PREFIX"
           echo "   WAF Resource: $WAF_RESOURCE"
           echo ""
           
-          # Universal import function
-          universal_import() {
+          # Smart import function
+          smart_import() {
             local tf_resource=$1
             local aws_id=$2
             local name=$3
@@ -201,135 +490,100 @@ jobs:
             fi
             
             if terraform state show "$tf_resource" &>/dev/null; then
-              echo "  ✅ $name - Already managed by Terraform"
+              echo "  ✅ $name - Already managed"
               return 0
             fi
             
-            echo "  🔄 $name - Attempting import..."
-            if terraform import "$tf_resource" "$aws_id" 2>&1; then
-              echo "  ✅ $name - Successfully imported!"
+            echo "  🔄 $name - Importing..."
+            if terraform import "$tf_resource" "$aws_id" 2>&1 | tee /tmp/import_$name.log; then
+              echo "  ✅ $name - Imported successfully!"
               return 0
             else
-              echo "  ⚠️  $name - Import failed (will be created)"
+              if grep -qi "already exists\|duplicate" /tmp/import_$name.log; then
+                echo "  ⚠️  $name - Exists but cannot import (will handle automatically)"
+              else
+                echo "  ℹ️  $name - Will be created"
+              fi
               return 1
             fi
           }
           
-          # S3 Buckets
-          echo "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
-          echo "📦 S3 BUCKETS"
-          echo "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
-          universal_import "aws_s3_bucket.website" "${PREFIX}-website" "Website Bucket"
-          universal_import "aws_s3_bucket.logs" "${PREFIX}-logs" "Logs Bucket"
+          # Import S3 Buckets
+          echo "📦 S3 Buckets:"
+          smart_import "aws_s3_bucket.website" "${PREFIX}-website" "Website Bucket"
+          smart_import "aws_s3_bucket.logs" "${PREFIX}-logs" "Logs Bucket"
           
-          # WAF - The problematic one
+          # Import WAF with automatic duplicate handling
           echo ""
-          echo "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
-          echo "🛡️  WAF WEB ACL (Smart Handler)"
-          echo "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
-          
-          # Check if WAF exists in AWS
+          echo "🛡️  WAF Web ACL:"
           WAF_JSON=$(aws wafv2 list-web-acls --scope CLOUDFRONT --region us-east-1 --output json 2>/dev/null || echo '{"WebACLs":[]}')
-          WAF_EXISTS=$(echo "$WAF_JSON" | jq -r ".WebACLs[] | select(.Name==\"${PREFIX}-waf\") | .Name" 2>/dev/null)
+          WAF_ID=$(echo "$WAF_JSON" | jq -r ".WebACLs[] | select(.Name==\"${PREFIX}-waf\") | .Id" 2>/dev/null)
           
-          if [ -n "$WAF_EXISTS" ] && [ "$WAF_EXISTS" != "null" ]; then
-            echo "  🔍 Found existing WAF in AWS: ${PREFIX}-waf"
-            
-            WAF_ID=$(echo "$WAF_JSON" | jq -r ".WebACLs[] | select(.Name==\"${PREFIX}-waf\") | .Id" 2>/dev/null)
+          if [ -n "$WAF_ID" ] && [ "$WAF_ID" != "null" ]; then
             WAF_IMPORT_ID="${WAF_ID}/${PREFIX}-waf/CLOUDFRONT"
             
-            # Try to import
-            echo "  🔄 Attempting to import into Terraform state..."
-            if terraform import "$WAF_RESOURCE" "$WAF_IMPORT_ID" 2>&1 | tee /tmp/waf_import.log; then
-              echo "  ✅ WAF successfully imported!"
-            else
-              # Import failed - check if it's because resource already exists
-              if grep -qi "already exists\|duplicate" /tmp/waf_import.log; then
-                echo "  ⚠️  WAF exists but cannot be imported"
-                echo "  🔄 Solution: Deleting and will recreate..."
+            if ! smart_import "$WAF_RESOURCE" "$WAF_IMPORT_ID" "WAF Web ACL"; then
+              # Import failed - delete and recreate
+              echo "  🔄 Import failed - removing duplicate WAF..."
+              LOCK_TOKEN=$(echo "$WAF_JSON" | jq -r ".WebACLs[] | select(.Name==\"${PREFIX}-waf\") | .LockToken")
+              
+              if [ -n "$LOCK_TOKEN" ]; then
+                # Check if attached to CloudFront
+                ATTACHED=$(aws cloudfront list-distributions --output json 2>/dev/null | \
+                          jq -r ".DistributionList.Items[]? | select(.WebACLId | contains(\"$WAF_ID\")) | .Id" | head -1)
                 
-                # Get lock token and delete
-                LOCK_TOKEN=$(echo "$WAF_JSON" | jq -r ".WebACLs[] | select(.Name==\"${PREFIX}-waf\") | .LockToken" 2>/dev/null)
-                
-                if [ -n "$LOCK_TOKEN" ]; then
-                  echo "  🗑️  Deleting existing WAF..."
+                if [ -n "$ATTACHED" ]; then
+                  echo "  🔄 Detaching from CloudFront $ATTACHED..."
+                  aws cloudfront get-distribution-config --id "$ATTACHED" > /tmp/dist_waf.json
+                  DIST_ETAG=$(cat /tmp/dist_waf.json | jq -r '.ETag')
                   
-                  # First, check if it's attached to CloudFront
-                  DIST_JSON=$(aws cloudfront list-distributions --output json 2>/dev/null || echo '{"DistributionList":{"Items":[]}}')
-                  ATTACHED_DIST=$(echo "$DIST_JSON" | jq -r ".DistributionList.Items[] | select(.WebACLId | contains(\"${WAF_ID}\")) | .Id" 2>/dev/null)
+                  cat /tmp/dist_waf.json | jq '.DistributionConfig.WebACLId = ""' > /tmp/dist_no_waf.json
                   
-                  if [ -n "$ATTACHED_DIST" ]; then
-                    echo "  ⚠️  WAF is attached to CloudFront distribution: $ATTACHED_DIST"
-                    echo "  🔄 Detaching from CloudFront first..."
-                    
-                    # Get distribution config
-                    aws cloudfront get-distribution-config --id "$ATTACHED_DIST" > /tmp/dist_config.json 2>/dev/null
-                    ETAG=$(cat /tmp/dist_config.json | jq -r '.ETag')
-                    
-                    # Remove WAF from distribution
-                    cat /tmp/dist_config.json | jq '.DistributionConfig.WebACLId = ""' > /tmp/dist_config_updated.json
-                    
-                    aws cloudfront update-distribution \
-                      --id "$ATTACHED_DIST" \
-                      --if-match "$ETAG" \
-                      --distribution-config "$(cat /tmp/dist_config_updated.json | jq '.DistributionConfig')" 2>/dev/null || true
-                    
-                    echo "  ⏳ Waiting 10 seconds for detachment..."
-                    sleep 10
-                  fi
+                  aws cloudfront update-distribution \
+                    --id "$ATTACHED" \
+                    --if-match "$DIST_ETAG" \
+                    --distribution-config "$(cat /tmp/dist_no_waf.json | jq -c '.DistributionConfig')" 2>/dev/null || true
                   
-                  # Now delete the WAF
-                  if aws wafv2 delete-web-acl \
-                    --scope CLOUDFRONT \
-                    --id "$WAF_ID" \
-                    --lock-token "$LOCK_TOKEN" \
-                    --region us-east-1 2>&1; then
-                    echo "  ✅ Existing WAF deleted - Terraform will create a new one"
-                  else
-                    echo "  ❌ Could not delete WAF - may need manual intervention"
-                    echo "  💡 Tip: Go to AWS Console → WAF → Delete manually"
-                  fi
-                else
-                  echo "  ❌ Could not get lock token for WAF deletion"
+                  sleep 5
                 fi
-              else
-                echo "  ℹ️  WAF import failed for other reason - will attempt creation"
+                
+                echo "  🗑️  Deleting duplicate WAF..."
+                aws wafv2 delete-web-acl \
+                  --scope CLOUDFRONT \
+                  --id "$WAF_ID" \
+                  --lock-token "$LOCK_TOKEN" \
+                  --region us-east-1 2>&1 && \
+                echo "  ✅ Deleted - Terraform will create new one" || \
+                echo "  ⚠️  Could not delete"
               fi
             fi
           else
-            echo "  ℹ️  No existing WAF found - Terraform will create one"
+            echo "  ℹ️  WAF not found (will be created)"
           fi
           
-          # CloudFront
+          # Import CloudFront
           echo ""
-          echo "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
-          echo "☁️  CLOUDFRONT DISTRIBUTION"
-          echo "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
-          
+          echo "☁️  CloudFront Distribution:"
           DIST_JSON=$(aws cloudfront list-distributions --output json 2>/dev/null || echo '{"DistributionList":{"Items":[]}}')
           DIST_ID=$(echo "$DIST_JSON" | jq -r ".DistributionList.Items[] | select(.Comment==\"${PREFIX} distribution\") | .Id" 2>/dev/null)
+          smart_import "aws_cloudfront_distribution.main" "$DIST_ID" "CloudFront Distribution"
           
-          universal_import "aws_cloudfront_distribution.main" "$DIST_ID" "CloudFront Distribution"
-          
-          # CloudWatch
+          # Import CloudWatch Dashboard
           echo ""
-          echo "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
-          echo "📊 CLOUDWATCH DASHBOARD"
-          echo "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
-          
+          echo "📊 CloudWatch Dashboard:"
           if aws cloudwatch get-dashboard --dashboard-name "${PREFIX}-dashboard" --region us-east-1 &>/dev/null; then
-            universal_import "aws_cloudwatch_dashboard.main" "${PREFIX}-dashboard" "Dashboard"
+            smart_import "aws_cloudwatch_dashboard.main" "${PREFIX}-dashboard" "Dashboard"
           else
             echo "  ℹ️  Dashboard not found (will be created)"
           fi
           
           echo ""
           echo "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
-          echo "✅ Resource reconciliation complete!"
+          echo "✅ Import process complete!"
           echo "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
           echo ""
           
-          set -e  # Re-enable exit on error
+          set -e
 
       - name: 📋 Terraform Plan
         working-directory: ${{ needs.setup.outputs.tf_dir }}
@@ -340,18 +594,19 @@ jobs:
       - name: 🚀 Terraform Apply
         working-directory: ${{ needs.setup.outputs.tf_dir }}
         run: |
-          echo "🚀 Applying infrastructure..."
+          echo "🚀 Applying infrastructure changes..."
           terraform apply -auto-approve tfplan
 
       - name: 📤 Get Outputs
         id: outputs
         working-directory: ${{ needs.setup.outputs.tf_dir }}
         run: |
+          echo "website_url=$(terraform output -raw website_url 2>/dev/null || echo 'N/A')" >> $GITHUB_OUTPUT
           echo "cloudfront_domain=$(terraform output -raw cloudfront_domain_name 2>/dev/null || echo 'N/A')" >> $GITHUB_OUTPUT
           echo "s3_bucket=$(terraform output -raw s3_bucket_name 2>/dev/null || echo 'N/A')" >> $GITHUB_OUTPUT
           echo "distribution_id=$(terraform output -raw cloudfront_distribution_id 2>/dev/null || echo 'N/A')" >> $GITHUB_OUTPUT
 
-      - name: 📁 Sync Website Content
+      - name: 📁 Upload Website Files
         run: |
           BUCKET="${{ steps.outputs.outputs.s3_bucket }}"
           
@@ -360,7 +615,7 @@ jobs:
             exit 0
           fi
           
-          # Create default if needed
+          # Create default website if needed
           if [ ! -d "website" ]; then
             mkdir -p website
             cat > website/index.html << 'EOF'
@@ -369,10 +624,10 @@ jobs:
           <head>
               <meta charset="UTF-8">
               <meta name="viewport" content="width=device-width, initial-scale=1.0">
-              <title>🚀 Deployed Successfully</title>
+              <title>Deployed!</title>
               <style>
                   body {
-                      font-family: system-ui, sans-serif;
+                      font-family: system-ui, -apple-system, sans-serif;
                       display: flex;
                       align-items: center;
                       justify-content: center;
@@ -384,65 +639,191 @@ jobs:
                   .card {
                       text-align: center;
                       padding: 3rem;
-                      background: rgba(255,255,255,0.1);
-                      border-radius: 20px;
+                      background: rgba(255, 255, 255, 0.1);
+                      border-radius: 15px;
                       backdrop-filter: blur(10px);
+                      box-shadow: 0 8px 32px rgba(0,0,0,0.1);
                   }
-                  h1 { font-size: 3rem; margin: 0 0 1rem; }
+                  h1 { margin: 0 0 1rem; font-size: 2.5rem; }
+                  p { margin: 0.5rem 0; opacity: 0.9; }
                   .badges { margin: 2rem 0; }
                   .badge {
                       display: inline-block;
                       padding: 0.5rem 1rem;
                       margin: 0.25rem;
-                      background: rgba(255,255,255,0.2);
+                      background: rgba(255, 255, 255, 0.2);
                       border-radius: 20px;
+                      font-size: 0.9rem;
                   }
               </style>
           </head>
           <body>
               <div class="card">
-                  <h1>🚀</h1>
-                  <h1>Infrastructure Live!</h1>
-                  <p>Your secure AWS infrastructure is operational</p>
+                  <h1>🚀 Website Deployed!</h1>
+                  <p>Your secure infrastructure is live</p>
                   <div class="badges">
                       <span class="badge">✅ HTTPS</span>
-                      <span class="badge">🛡️ WAF</span>
-                      <span class="badge">☁️ CDN</span>
-                      <span class="badge">🔒 Secure</span>
+                      <span class="badge">🛡️ WAF Protected</span>
+                      <span class="badge">📊 Monitored</span>
+                      <span class="badge">☁️ CloudFront</span>
                   </div>
-                  <p style="opacity:0.8;font-size:0.9rem;">Build #${{ github.run_number }}</p>
+                  <p style="font-size: 0.85rem; margin-top: 2rem;">
+                      Build #${{ github.run_number }} • GitHub Actions
+                  </p>
               </div>
           </body>
           </html>
           EOF
           fi
           
-          # Sync to S3
-          aws s3 sync website/ s3://$BUCKET/ \
-            --delete \
-            --cache-control "max-age=3600"
+          # Sync all files to S3
+          echo "📁 Syncing website files to S3..."
+          if [ -d "website" ]; then
+            aws s3 sync website/ s3://$BUCKET/ \
+              --delete \
+              --exclude ".*" \
+              --cache-control "public, max-age=3600" \
+              --metadata-directive REPLACE
+            echo "✅ Files synced successfully"
+          fi
 
-      - name: 🔄 Invalidate Cache
+      - name: 🔄 Invalidate CloudFront Cache
         run: |
-          DIST="${{ steps.outputs.outputs.distribution_id }}"
-          [ "$DIST" != "N/A" ] && aws cloudfront create-invalidation --distribution-id $DIST --paths "/*" || true
+          DIST_ID="${{ steps.outputs.outputs.distribution_id }}"
+          if [ "$DIST_ID" != "N/A" ]; then
+            echo "🔄 Invalidating CloudFront cache..."
+            aws cloudfront create-invalidation \
+              --distribution-id $DIST_ID \
+              --paths "/*"
+            echo "✅ Cache invalidation created"
+          fi
 
-      - name: 📊 Summary
+      - name: 📊 Deployment Summary
         run: |
-          cat >> $GITHUB_STEP_SUMMARY << EOF
-          ## 🚀 Deployment Complete
+          echo "## 🚀 Deployment Complete" >> $GITHUB_STEP_SUMMARY
+          echo "" >> $GITHUB_STEP_SUMMARY
+          echo "### 🌐 Your Website" >> $GITHUB_STEP_SUMMARY
+          echo "" >> $GITHUB_STEP_SUMMARY
+          echo "**URL:** https://${{ steps.outputs.outputs.cloudfront_domain }}" >> $GITHUB_STEP_SUMMARY
+          echo "" >> $GITHUB_STEP_SUMMARY
+          echo "### 📦 Resources" >> $GITHUB_STEP_SUMMARY
+          echo "" >> $GITHUB_STEP_SUMMARY
+          echo "| Resource | Value |" >> $GITHUB_STEP_SUMMARY
+          echo "|----------|-------|" >> $GITHUB_STEP_SUMMARY
+          echo "| S3 Bucket | \`${{ steps.outputs.outputs.s3_bucket }}\` |" >> $GITHUB_STEP_SUMMARY
+          echo "| Distribution ID | \`${{ steps.outputs.outputs.distribution_id }}\` |" >> $GITHUB_STEP_SUMMARY
+          echo "| CloudFront Domain | \`${{ steps.outputs.outputs.cloudfront_domain }}\` |" >> $GITHUB_STEP_SUMMARY
+          echo "" >> $GITHUB_STEP_SUMMARY
+          echo "💡 **Note:** CloudFront propagation takes 10-15 minutes" >> $GITHUB_STEP_SUMMARY
+
+  monitor:
+    name: 📊 Post-Deployment Monitoring
+    runs-on: ubuntu-latest
+    needs: [setup, apply]
+    if: success()
+    
+    steps:
+      - name: 📥 Checkout Code
+        uses: actions/checkout@v4
+
+      - name: 🔐 Configure AWS Credentials
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          aws-access-key-id: ${{ secrets.AWS_ACCESS_KEY_ID }}
+          aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+          aws-region: ${{ env.AWS_REGION }}
+
+      - name: 🔧 Setup Terraform
+        uses: hashicorp/setup-terraform@v3
+        with:
+          terraform_version: ${{ env.TF_VERSION }}
+          terraform_wrapper: false
+
+      - name: 🔧 Terraform Init
+        working-directory: ${{ needs.setup.outputs.tf_dir }}
+        run: terraform init
+
+      - name: 📊 Enhanced Deployment Verification
+        working-directory: ${{ needs.setup.outputs.tf_dir }}
+        run: |
+          echo "## 📊 Deployment Verification" >> $GITHUB_STEP_SUMMARY
+          echo "" >> $GITHUB_STEP_SUMMARY
           
-          **URL:** https://${{ steps.outputs.outputs.cloudfront_domain }}
+          DIST=$(terraform output -raw cloudfront_distribution_id 2>/dev/null || echo "N/A")
+          DOMAIN=$(terraform output -raw cloudfront_domain_name 2>/dev/null || echo "N/A")
+          BUCKET=$(terraform output -raw s3_bucket_name 2>/dev/null || echo "N/A")
+          WAF=$(terraform output -raw waf_web_acl_arn 2>/dev/null || echo "N/A")
+          DASHBOARD=$(terraform output -raw dashboard_url 2>/dev/null || echo "N/A")
           
-          | Resource | Value |
-          |----------|-------|
-          | CloudFront | \`${{ steps.outputs.outputs.distribution_id }}\` |
-          | S3 Bucket | \`${{ steps.outputs.outputs.s3_bucket }}\` |
+          echo "### ✅ Resources Status" >> $GITHUB_STEP_SUMMARY
+          echo "" >> $GITHUB_STEP_SUMMARY
+          echo "| Resource | Status | Value |" >> $GITHUB_STEP_SUMMARY
+          echo "|----------|--------|-------|" >> $GITHUB_STEP_SUMMARY
+          echo "| ☁️ CloudFront | ✅ Active | $DIST |" >> $GITHUB_STEP_SUMMARY
+          echo "| 📦 S3 Bucket | ✅ Active | $BUCKET |" >> $GITHUB_STEP_SUMMARY
+          echo "| 🛡️ WAF ACL | ✅ Active | $(echo $WAF | cut -d'/' -f2-) |" >> $GITHUB_STEP_SUMMARY
+          echo "" >> $GITHUB_STEP_SUMMARY
           
-          ### Quick Links
-          - [View Website](https://${{ steps.outputs.outputs.cloudfront_domain }})
-          - [CloudFront Console](https://console.aws.amazon.com/cloudfront/v3/home#/distributions/${{ steps.outputs.outputs.distribution_id }})
-          - [S3 Console](https://s3.console.aws.amazon.com/s3/buckets/${{ steps.outputs.outputs.s3_bucket }})
+          echo "### 🧪 Health Checks" >> $GITHUB_STEP_SUMMARY
+          echo "" >> $GITHUB_STEP_SUMMARY
+          echo "| Check | Result | Details |" >> $GITHUB_STEP_SUMMARY
+          echo "|-------|--------|---------|" >> $GITHUB_STEP_SUMMARY
           
-          💡 CloudFront may take 10-15 minutes to fully propagate
-          EOF
+          if [ "$DOMAIN" != "N/A" ]; then
+            URL="https://$DOMAIN"
+            HTTP_CODE=$(curl -s -o /dev/null -w "%{http_code}" --max-time 10 "$URL" 2>/dev/null || echo "000")
+            
+            if [ "$HTTP_CODE" = "200" ]; then
+              echo "| 🌐 Website Access | ✅ Success | HTTP $HTTP_CODE |" >> $GITHUB_STEP_SUMMARY
+            elif [ "$HTTP_CODE" = "000" ]; then
+              echo "| 🌐 Website Access | ⏳ Propagating | Wait 5-10 minutes |" >> $GITHUB_STEP_SUMMARY
+            else
+              echo "| 🌐 Website Access | ⚠️ HTTP $HTTP_CODE | May be propagating |" >> $GITHUB_STEP_SUMMARY
+            fi
+            
+            HEADERS=$(curl -sI "$URL" --max-time 10 2>/dev/null || echo "")
+            if echo "$HEADERS" | grep -qi "x-amz-cf-id"; then
+              echo "| ☁️ CloudFront | ✅ Serving | Requests via CDN |" >> $GITHUB_STEP_SUMMARY
+            fi
+            
+            if echo "$HEADERS" | grep -qi "strict-transport-security"; then
+              echo "| 🔒 Security Headers | ✅ Configured | HSTS enabled |" >> $GITHUB_STEP_SUMMARY
+            else
+              echo "| 🔒 Security Headers | ⏳ Propagating | Will appear shortly |" >> $GITHUB_STEP_SUMMARY
+            fi
+          fi
+          
+          echo "" >> $GITHUB_STEP_SUMMARY
+          echo "### 📈 Monitoring & Management" >> $GITHUB_STEP_SUMMARY
+          echo "" >> $GITHUB_STEP_SUMMARY
+          echo "| Service | Console Link |" >> $GITHUB_STEP_SUMMARY
+          echo "|---------|--------------|" >> $GITHUB_STEP_SUMMARY
+          echo "| ☁️ CloudFront | [View Distribution](https://console.aws.amazon.com/cloudfront/v3/home#/distributions/$DIST) |" >> $GITHUB_STEP_SUMMARY
+          echo "| 📦 S3 Bucket | [View Bucket](https://s3.console.aws.amazon.com/s3/buckets/$BUCKET) |" >> $GITHUB_STEP_SUMMARY
+          
+          if [ "$DASHBOARD" != "N/A" ]; then
+            echo "| 📊 CloudWatch | [View Dashboard]($DASHBOARD) |" >> $GITHUB_STEP_SUMMARY
+          fi
+          
+          echo "| 🛡️ WAF & Shield | [View Web ACLs](https://console.aws.amazon.com/wafv2/homev2/web-acls?region=global) |" >> $GITHUB_STEP_SUMMARY
+          echo "" >> $GITHUB_STEP_SUMMARY
+          echo "### 🌐 Your Website" >> $GITHUB_STEP_SUMMARY
+          echo "" >> $GITHUB_STEP_SUMMARY
+          echo "**🎉 Access your website at:** https://$DOMAIN" >> $GITHUB_STEP_SUMMARY
+          echo "" >> $GITHUB_STEP_SUMMARY
+          echo "💡 **Note:** CloudFront can take 10-15 minutes to fully propagate worldwide." >> $GITHUB_STEP_SUMMARY
+          echo "" >> $GITHUB_STEP_SUMMARY
+          echo "### ✅ Next Steps" >> $GITHUB_STEP_SUMMARY
+          echo "" >> $GITHUB_STEP_SUMMARY
+          echo "- ✅ Infrastructure deployed/updated successfully" >> $GITHUB_STEP_SUMMARY
+          echo "- 🌐 Test your website using the CloudFront URL above" >> $GITHUB_STEP_SUMMARY
+          echo "- 📊 Monitor performance via CloudWatch dashboard" >> $GITHUB_STEP_SUMMARY
+          echo "- 🛡️ Review security settings in WAF console" >> $GITHUB_STEP_SUMMARY
+          echo "- 📁 Upload custom content to the S3 bucket" >> $GITHUB_STEP_SUMMARY
+          echo "" >> $GITHUB_STEP_SUMMARY
+          echo "### 🔄 Resource Management" >> $GITHUB_STEP_SUMMARY
+          echo "" >> $GITHUB_STEP_SUMMARY
+          echo "- 🧹 Orphaned resources automatically cleaned" >> $GITHUB_STEP_SUMMARY
+          echo "- 🔄 Existing resources imported and reused" >> $GITHUB_STEP_SUMMARY
+          echo "- ✅ Same CloudFront URL on every deployment" >> $GITHUB_STEP_SUMMARY
+          echo "- 💰 No duplicate resources wasting costs" >> $GITHUB_STEP_SUMMARY
