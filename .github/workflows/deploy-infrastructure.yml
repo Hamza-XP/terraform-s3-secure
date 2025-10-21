@@ -300,10 +300,11 @@ jobs:
           }
           
           # ================================================================
-          # 1. CLOUDFRONT ORIGIN ACCESS CONTROLS (OAC)
+          # 1. CLOUDFRONT ORIGIN ACCESS CONTROLS (OAC) - FIXED
           # ================================================================
           echo "🔒 Scanning CloudFront Origin Access Controls..."
-          
+
+          # Use proper JSON query to get OAC data
           aws cloudfront list-origin-access-controls --output json 2>/dev/null | \
           jq -r '.OriginAccessControlList.Items[]? | "\(.Id)|\(.Name)"' | \
           while IFS='|' read -r oac_id oac_name; do
@@ -312,19 +313,25 @@ jobs:
                 echo "  ✅ $oac_name - Managed"
               else
                 echo "  🗑️  Orphaned: $oac_name"
+                # Get current ETag and delete
                 ETAG=$(aws cloudfront get-origin-access-control --id "$oac_id" --query 'ETag' --output text 2>/dev/null)
-                aws cloudfront delete-origin-access-control --id "$oac_id" --if-match "$ETAG" 2>&1 && \
-                echo "     ✅ Deleted" || echo "     ⚠️  Could not delete"
+                if [ -n "$ETAG" ]; then
+                  aws cloudfront delete-origin-access-control --id "$oac_id" --if-match "$ETAG" 2>&1 && \
+                  echo "     ✅ Deleted" || echo "     ⚠️  Failed to delete"
+                else
+                  echo "     ❌ Could not get ETag for deletion"
+                fi
               fi
             fi
           done
-          
+
           # ================================================================
           # 2. CLOUDFRONT RESPONSE HEADERS POLICIES
           # ================================================================
           echo ""
           echo "📋 Scanning CloudFront Response Headers Policies..."
-          
+
+          # Use proper JSON query for response headers policies
           aws cloudfront list-response-headers-policies --type custom --output json 2>/dev/null | \
           jq -r '.ResponseHeadersPolicyList.Items[]? | "\(.ResponseHeadersPolicy.Id)|\(.ResponseHeadersPolicy.ResponseHeadersPolicyConfig.Name)"' | \
           while IFS='|' read -r policy_id policy_name; do
@@ -333,9 +340,14 @@ jobs:
                 echo "  ✅ $policy_name - Managed"
               else
                 echo "  🗑️  Orphaned: $policy_name"
+                # Get current ETag and delete
                 ETAG=$(aws cloudfront get-response-headers-policy --id "$policy_id" --query 'ETag' --output text 2>/dev/null)
-                aws cloudfront delete-response-headers-policy --id "$policy_id" --if-match "$ETAG" 2>&1 && \
-                echo "     ✅ Deleted" || echo "     ⚠️  Could not delete"
+                if [ -n "$ETAG" ]; then
+                  aws cloudfront delete-response-headers-policy --id "$policy_id" --if-match "$ETAG" 2>&1 && \
+                  echo "     ✅ Deleted" || echo "     ⚠️  Failed to delete"
+                else
+                  echo "     ❌ Could not get ETag for deletion"
+                fi
               fi
             fi
           done
