@@ -465,6 +465,125 @@ jobs:
             echo "     ✅ Deleted" || \
             echo "     ⚠️  Could not delete"
           done
+
+          # ================================================================
+          # 6. CLEANUP ORPHANED IAM ROLES
+          # ================================================================
+          echo ""
+          echo "👤 Scanning IAM Roles..."
+
+          aws iam list-roles --query 'Roles[].RoleName' --output text 2>/dev/null | \
+          tr '\t' '\n' | grep "${TARGET_PREFIX}" | \
+          while read -r role; do
+            # Skip if this is our current managed role
+            if [ "$role" = "${TARGET_PREFIX}-firehose-role" ] && is_managed "aws_iam_role.firehose_delivery_role"; then
+              echo "  ✅ $role - Current IAM role (managed)"
+              continue
+            fi
+            
+            # This is an orphaned role
+            echo "  🗑️  Found orphaned: $role"
+            
+            # Delete inline policies first
+            echo "     Removing inline policies..."
+            aws iam list-role-policies --role-name "$role" --query 'PolicyNames' --output text 2>/dev/null | \
+            tr '\t' '\n' | while read -r policy; do
+              aws iam delete-role-policy --role-name "$role" --policy-name "$policy" 2>/dev/null && \
+              echo "       ✅ Deleted policy: $policy" || \
+              echo "       ⚠️  Could not delete policy: $policy"
+            done
+            
+            # Delete attached policies
+            echo "     Detaching managed policies..."
+            aws iam list-attached-role-policies --role-name "$role" --query 'AttachedPolicies[].PolicyArn' --output text 2>/dev/null | \
+            tr '\t' '\n' | while read -r policy_arn; do
+              aws iam detach-role-policy --role-name "$role" --policy-arn "$policy_arn" 2>/dev/null && \
+              echo "       ✅ Detached policy: $(basename $policy_arn)" || \
+              echo "       ⚠️  Could not detach policy: $(basename $policy_arn)"
+            done
+            
+            # Delete the role
+            echo "     Deleting role..."
+            aws iam delete-role --role-name "$role" 2>&1 && \
+            echo "     ✅ Deleted" || \
+            echo "     ⚠️  Could not delete"
+          done
+
+          # ================================================================
+          # 7. CLEANUP ORPHANED CLOUDFRONT OAC
+          # ================================================================
+          echo ""
+          echo "🔒 Scanning CloudFront Origin Access Controls..."
+
+          aws cloudfront list-origin-access-controls --query 'OriginAccessControlList.Items[].Name' --output text 2>/dev/null | \
+          tr '\t' '\n' | grep "${TARGET_PREFIX}" | \
+          while read -r oac_name; do
+            # Skip if this is our current managed OAC
+            if [ "$oac_name" = "${TARGET_PREFIX}-oac" ] && is_managed "aws_cloudfront_origin_access_control.website"; then
+              echo "  ✅ $oac_name - Current OAC (managed)"
+              continue
+            fi
+            
+            # This is an orphaned OAC
+            echo "  🗑️  Found orphaned: $oac_name"
+            
+            # Get OAC ID and delete
+            OAC_ID=$(aws cloudfront list-origin-access-controls --query "OriginAccessControlList.Items[?Name=='$oac_name'].Id" --output text 2>/dev/null)
+            if [ -n "$OAC_ID" ]; then
+              aws cloudfront delete-origin-access-control --id "$OAC_ID" 2>&1 && \
+              echo "     ✅ Deleted" || \
+              echo "     ⚠️  Could not delete"
+            fi
+          done
+
+          # ================================================================
+          # 8. CLEANUP ORPHANED CLOUDFRONT RESPONSE HEADERS POLICIES
+          # ================================================================
+          echo ""
+          echo "📋 Scanning CloudFront Response Headers Policies..."
+
+          aws cloudfront list-response-headers-policies --query 'ResponseHeadersPolicyList.Items[].Name' --output text 2>/dev/null | \
+          tr '\t' '\n' | grep "${TARGET_PREFIX}" | \
+          while read -r policy_name; do
+            # Skip if this is our current managed policy
+            if [ "$policy_name" = "${TARGET_PREFIX}-security-headers" ] && is_managed "aws_cloudfront_response_headers_policy.security_headers"; then
+              echo "  ✅ $policy_name - Current headers policy (managed)"
+              continue
+            fi
+            
+            # This is an orphaned policy
+            echo "  🗑️  Found orphaned: $policy_name"
+            
+            # Get policy ID and delete
+            POLICY_ID=$(aws cloudfront list-response-headers-policies --query "ResponseHeadersPolicyList.Items[?Name=='$policy_name'].Id" --output text 2>/dev/null)
+            if [ -n "$POLICY_ID" ]; then
+              aws cloudfront delete-response-headers-policy --id "$POLICY_ID" 2>&1 && \
+              echo "     ✅ Deleted" || \
+              echo "     ⚠️  Could not delete"
+            fi
+          done
+
+          # ================================================================
+          # 9. CLEANUP ORPHANED KINESIS FIREHOSE DELIVERY STREAMS
+          # ================================================================
+          echo ""
+          echo "🔥 Scanning Kinesis Firehose Delivery Streams..."
+
+          aws firehose list-delivery-streams --query 'DeliveryStreamNames' --output text 2>/dev/null | \
+          tr '\t' '\n' | grep "${TARGET_PREFIX}" | \
+          while read -r stream; do
+            # Skip if this is our current managed firehose
+            if [ "$stream" = "aws-waf-logs-${TARGET_PREFIX}" ] && is_managed "aws_kinesis_firehose_delivery_stream.waf_logs"; then
+              echo "  ✅ $stream - Current firehose (managed)"
+              continue
+            fi
+            
+            # This is an orphaned firehose
+            echo "  🗑️  Found orphaned: $stream"
+            aws firehose delete-delivery-stream --delivery-stream-name "$stream" 2>&1 && \
+            echo "     ✅ Deleted" || \
+            echo "     ⚠️  Could not delete"
+          done
           
           echo ""
           echo "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
