@@ -299,8 +299,61 @@ jobs:
             terraform state list 2>/dev/null | grep -q "^$1$"
           }
 
+          # ---------- helper utilities ----------
+          log() { echo "[$(date -u +'%Y-%m-%dT%H:%M:%SZ')] $*"; }
+          retry() {
+            # retry <retries> <sleep> -- command...
+            local retries=$1; shift
+            local sleep_sec=$1; shift
+            local i=0
+            until "$@" ; do
+              i=$((i+1))
+              if [ "$i" -gt "$retries" ]; then
+                log "❌ Command failed after $retries attempts: $*"
+                return 1
+              fi
+              log "⏱ retry $i/$retries in ${sleep_sec}s..."
+              sleep "$sleep_sec"
+            done
+            return 0
+          }
+          # wait until CloudFront shows no reference to a given id (poll)
+          wait_for_cf_detach() {
+            local type="$1"   # "oac" or "rhp"
+            local id="$2"
+            local timeout=${3:-120}
+            local elapsed=0
+            local step=5
+            while [ "$elapsed" -lt "$timeout" ]; do
+              if [ "$type" = "oac" ]; then
+                # check origins for the OAC id
+                FOUND=$(aws cloudfront list-distributions --output json 2>/dev/null | \
+                  jq -r --arg id "$id" '.DistributionList.Items[]? |
+                    select((.DistributionConfig.Origins.Items[]?.OriginAccessControlId // "") | contains($id)) | .Id' | head -1)
+              else
+                # check behaviors for the ResponseHeadersPolicyId OR default cache behavior
+                FOUND=$(aws cloudfront list-distributions --output json 2>/dev/null | \
+                  jq -r --arg id "$id" '.DistributionList.Items[]? |
+                    ( .DistributionConfig.CacheBehaviors.Items[]? | select(.ResponseHeadersPolicyId == $id) | true ) // 
+                    ( .DistributionConfig.DefaultCacheBehavior.ResponseHeadersPolicyId == $id ) |
+                    select(.) |
+                    .Id' | head -1)
+              fi
+
+              if [ -z "$FOUND" ]; then
+                log "✅ No CloudFront distributions reference $type id=$id"
+                return 0
+              fi
+              log "⚠️  Still attached to distribution $FOUND; waiting..."
+              sleep "$step"
+              elapsed=$((elapsed+step))
+            done
+            log "❌ Timeout waiting for detach of $type id=$id"
+            return 1
+          }
+
           # ================================================================
-          # 1. CLOUDFRONT DISTRIBUTIONS
+          # 1. CLOUDFRONT DISTRIBUTIONS (MUST BE FIRST - REMOVE DEPENDENCIES)
           # ================================================================
           echo "☁️  Scanning CloudFront Distributions..."
 
@@ -324,7 +377,7 @@ jobs:
                     2>/dev/null && echo "     ✅ Disabled" || echo "     ⚠️  Failed to disable"
                 fi
                 
-                # DELETE the distribution (not just disable)
+                # DELETE the distribution
                 echo "     Deleting distribution..."
                 ETAG=$(aws cloudfront get-distribution --id "$dist_id" --query 'ETag' --output text 2>/dev/null)
                 if [ -n "$ETAG" ]; then
@@ -337,67 +390,130 @@ jobs:
 
           # Wait for distributions to be removed
           echo "     Waiting for CloudFront distributions to be removed..."
-          sleep 5
+          sleep 30
 
-          # ================================================================
-          # 2. CLOUDFRONT ORIGIN ACCESS CONTROLS (OAC) - FIXED
-          # ================================================================
-          echo "🔒 Scanning CloudFront Origin Access Controls..."
+          # ---------- CLOUD FRONT ORIGIN ACCESS CONTROLS ----------
+          log "🔒 Scanning CloudFront Origin Access Controls..."
 
-          # Use proper JSON query to get OAC data
           aws cloudfront list-origin-access-controls --output json 2>/dev/null | \
           jq -r '.OriginAccessControlList.Items[]? | "\(.Id)|\(.Name)"' | \
           while IFS='|' read -r oac_id oac_name; do
             if [[ "$oac_name" == *"$TARGET_PREFIX"* ]]; then
               if is_managed "aws_cloudfront_origin_access_control.website"; then
-                echo "  ✅ $oac_name - Managed"
+                log "  ✅ $oac_name - Managed by Terraform"
               else
-                echo "  🗑️  Orphaned: $oac_name"
-                # Get current ETag and delete
-                ETAG=$(aws cloudfront get-origin-access-control --id "$oac_id" --query 'ETag' --output text 2>/dev/null)
-                if [ -n "$ETAG" ]; then
-                  aws cloudfront delete-origin-access-control --id "$oac_id" --if-match "$ETAG" 2>&1 && \
-                  echo "     ✅ Deleted" || echo "     ⚠️  Failed to delete"
+                log "  🗑️  Orphaned OAC: $oac_name ($oac_id)"
+                # Try to import into terraform first
+                if terraform state show aws_cloudfront_origin_access_control.website &>/dev/null; then
+                  log "     Already in tfstate: aws_cloudfront_origin_access_control.website"
                 else
-                  echo "     ❌ Could not get ETag for deletion"
+                  log "     Attempting terraform import..."
+                  if terraform import -lock=false aws_cloudfront_origin_access_control.website "$oac_id" 2>&1 | tee /tmp/import_oac.log; then
+                    log "     ✅ Imported OAC into terraform"
+                    continue
+                  else
+                    log "     ⚠️  Import failed - will attempt safe detach & delete"
+                    # Find distributions referencing this OAC and remove the origin AccessControlId
+                    DIST_IDS=$(aws cloudfront list-distributions --output json 2>/dev/null | \
+                      jq -r --arg id "$oac_id" '.DistributionList.Items[]? |
+                        select((.DistributionConfig.Origins.Items[]?.OriginAccessControlId // "") | contains($id)) | .Id')
+                    
+                    for dist in $DIST_IDS; do
+                      log "     🔄 Updating distribution $dist to remove OAC reference..."
+                      aws cloudfront get-distribution-config --id "$dist" > /tmp/dist_cfg_$dist.json
+                      ETAG=$(jq -r '.ETag' /tmp/dist_cfg_$dist.json)
+                      # remove OriginAccessControlId in all origins that match
+                      jq --arg id "$oac_id" '.DistributionConfig.Origins.Items |= map(
+                           if .OriginAccessControlId == $id then .OriginAccessControlId = "" else . end
+                         )' /tmp/dist_cfg_$dist.json > /tmp/dist_cfg_no_oac_$dist.json
+                      retry 3 5 aws cloudfront update-distribution --id "$dist" --if-match "$ETAG" --distribution-config "$(jq -c '.DistributionConfig' /tmp/dist_cfg_no_oac_$dist.json)" || log "     ⚠️  update-distribution failed for $dist"
+                    done
+
+                    # wait until no dist references OAC
+                    wait_for_cf_detach "oac" "$oac_id" 180 || log "     ⚠️  Some distributions still reference OAC $oac_id"
+
+                    # re-get etag and attempt delete (delete requires If-Match header but get-origin-access-control returns ETag)
+                    ETAG=$(aws cloudfront get-origin-access-control --id "$oac_id" --query 'ETag' --output text 2>/dev/null)
+                    if [ -n "$ETAG" ]; then
+                      if aws cloudfront delete-origin-access-control --id "$oac_id" --if-match "$ETAG" 2>/dev/null; then
+                        log "     ✅ Deleted OAC $oac_name"
+                      else
+                        log "     ⚠️  Failed to delete OAC $oac_name (maybe still attached or IAM issue)"
+                      fi
+                    else
+                      log "     ❌ Could not fetch ETag for OAC $oac_id; skipping deletion"
+                    fi
+                  fi
                 fi
               fi
             fi
           done
 
-          # ================================================================
-          # 3. CLOUDFRONT RESPONSE HEADERS POLICIES
-          # ================================================================
-          echo ""
-          echo "📋 Scanning CloudFront Response Headers Policies..."
-
-          # Use proper JSON query for response headers policies
+          # ---------- CLOUD FRONT RESPONSE HEADERS POLICIES ----------
+          log "📋 Scanning CloudFront Response Headers Policies..."
           aws cloudfront list-response-headers-policies --type custom --output json 2>/dev/null | \
           jq -r '.ResponseHeadersPolicyList.Items[]? | "\(.ResponseHeadersPolicy.Id)|\(.ResponseHeadersPolicy.ResponseHeadersPolicyConfig.Name)"' | \
           while IFS='|' read -r policy_id policy_name; do
             if [[ "$policy_name" == *"$TARGET_PREFIX"* ]]; then
               if is_managed "aws_cloudfront_response_headers_policy.security_headers"; then
-                echo "  ✅ $policy_name - Managed"
+                log "  ✅ $policy_name - Managed by Terraform"
               else
-                echo "  🗑️  Orphaned: $policy_name"
-                # Get current ETag and delete
-                ETAG=$(aws cloudfront get-response-headers-policy --id "$policy_id" --query 'ETag' --output text 2>/dev/null)
-                if [ -n "$ETAG" ]; then
-                  aws cloudfront delete-response-headers-policy --id "$policy_id" --if-match "$ETAG" 2>&1 && \
-                  echo "     ✅ Deleted" || echo "     ⚠️  Failed to delete"
+                log "  🗑️  Orphaned RHP: $policy_name ($policy_id)"
+                # Try to import first
+                if terraform state show aws_cloudfront_response_headers_policy.security_headers &>/dev/null; then
+                  log "     Already in tfstate: aws_cloudfront_response_headers_policy.security_headers"
                 else
-                  echo "     ❌ Could not get ETag for deletion"
+                  log "     Attempting terraform import..."
+                  if terraform import -lock=false aws_cloudfront_response_headers_policy.security_headers "$policy_id" 2>&1 | tee /tmp/import_rhp.log; then
+                    log "     ✅ Imported Response Headers Policy into terraform"
+                    continue
+                  else
+                    log "     ⚠️  Import failed - will attempt to detach from cache behaviors and delete"
+                    # iterate distributions and remove any ResponseHeadersPolicyId references in default and cache behaviors
+                    DIST_IDS=$(aws cloudfront list-distributions --output json 2>/dev/null | \
+                      jq -r --arg pid "$policy_id" '.DistributionList.Items[]? |
+                        select((.DistributionConfig.DefaultCacheBehavior.ResponseHeadersPolicyId == $pid) or
+                               (.DistributionConfig.CacheBehaviors.Items[]? | select(.ResponseHeadersPolicyId == $pid) | . == .)) | .Id' | sort -u)
+                    
+                    for dist in $DIST_IDS; do
+                      log "     🔄 Updating distribution $dist to remove ResponseHeadersPolicy $policy_id..."
+                      aws cloudfront get-distribution-config --id "$dist" > /tmp/dist_rhp_$dist.json
+                      ETAG=$(jq -r '.ETag' /tmp/dist_rhp_$dist.json)
+                      # remove from default cache behavior
+                      jq --arg pid "$policy_id" '
+                        .DistributionConfig |
+                        (if .DefaultCacheBehavior.ResponseHeadersPolicyId == $pid then .DefaultCacheBehavior.ResponseHeadersPolicyId = "" else . end) |
+                        (.CacheBehaviors.Items |= map(if .ResponseHeadersPolicyId == $pid then .ResponseHeadersPolicyId = "" else . end))
+                      ' /tmp/dist_rhp_$dist.json > /tmp/dist_rhp_no_pid_$dist.json
+
+                      retry 3 5 aws cloudfront update-distribution --id "$dist" --if-match "$ETAG" --distribution-config "$(jq -c '.DistributionConfig' /tmp/dist_rhp_no_pid_$dist.json)" || log "     ⚠️  update-distribution failed for $dist"
+                    done
+
+                    wait_for_cf_detach "rhp" "$policy_id" 180 || log "     ⚠️  Some distributions still reference RHP $policy_id"
+
+                    # now try delete
+                    ETAG=$(aws cloudfront get-response-headers-policy --id "$policy_id" --query 'ETag' --output text 2>/dev/null)
+                    if [ -n "$ETAG" ]; then
+                      if aws cloudfront delete-response-headers-policy --id "$policy_id" --if-match "$ETAG" 2>/dev/null; then
+                        log "     ✅ Deleted Response Headers Policy $policy_name"
+                      else
+                        log "     ⚠️  Failed to delete Response Headers Policy $policy_name (might still be attached)"
+                      fi
+                    else
+                      log "     ❌ Could not get ETag for Response Headers Policy $policy_id"
+                    fi
+                  fi
                 fi
               fi
             fi
           done
-          
+
           # ================================================================
-          # 4. WAF WEB ACLs
+          # 2. WAF WEB ACLs (NOW CAN BE DELETED SINCE CLOUDFRONT IS GONE)
           # ================================================================
           echo ""
           echo "🛡️  Scanning WAF Web ACLs..."
-          
+
           aws wafv2 list-web-acls --scope CLOUDFRONT --region us-east-1 --output json 2>/dev/null | \
           jq -r '.WebACLs[]? | "\(.Id)|\(.Name)|\(.LockToken)"' | \
           while IFS='|' read -r waf_id waf_name lock_token; do
@@ -406,20 +522,15 @@ jobs:
                 echo "  ✅ $waf_name - Managed"
               else
                 echo "  🗑️  Orphaned: $waf_name"
-                ATTACHED=$(aws cloudfront list-distributions --output json 2>/dev/null | \
-                          jq -r ".DistributionList.Items[]? | select(.WebACLId | contains(\"$waf_id\")) | .Id" | head -1)
-                if [ -z "$ATTACHED" ]; then
-                  aws wafv2 delete-web-acl --scope CLOUDFRONT --id "$waf_id" --lock-token "$lock_token" --region us-east-1 2>&1 && \
-                  echo "     ✅ Deleted" || echo "     ⚠️  Failed"
-                else
-                  echo "     ⚠️  Attached to CloudFront"
-                fi
+                # Now it should be deletable since CloudFront distributions are gone
+                aws wafv2 delete-web-acl --scope CLOUDFRONT --id "$waf_id" --lock-token "$lock_token" --region us-east-1 2>&1 && \
+                echo "     ✅ Deleted" || echo "     ⚠️  Failed to delete"
               fi
             fi
           done
           
           # ================================================================
-          # 5. CLOUDWATCH LOG GROUPS
+          # 3. CLOUDWATCH LOG GROUPS
           # ================================================================
           echo ""
           echo "📝 Scanning CloudWatch Log Groups..."
@@ -437,7 +548,7 @@ jobs:
           done
           
           # ================================================================
-          # 6. KINESIS FIREHOSE DELIVERY STREAMS
+          # 4. KINESIS FIREHOSE DELIVERY STREAMS
           # ================================================================
           echo ""
           echo "🔥 Scanning Kinesis Firehose Delivery Streams..."
@@ -455,7 +566,7 @@ jobs:
           done
           
           # ================================================================
-          # 7. IAM ROLES (with policy cleanup)
+          # 5. IAM ROLES (with policy cleanup)
           # ================================================================
           echo ""
           echo "👤 Scanning IAM Roles..."
@@ -489,7 +600,7 @@ jobs:
           done
           
           # ================================================================
-          # 8. S3 BUCKETS (enhanced emptying)
+          # 6. S3 BUCKETS (enhanced emptying)
           # ================================================================
           echo ""
           echo "📦 Scanning S3 Buckets..."
@@ -531,7 +642,7 @@ jobs:
           done
 
           # ================================================================
-          # 9. CLOUDWATCH ALARMS
+          # 7. CLOUDWATCH ALARMS
           # ================================================================
           echo ""
           echo "🚨 Scanning CloudWatch Alarms..."
@@ -627,39 +738,7 @@ jobs:
             WAF_IMPORT_ID="${WAF_ID}/${PREFIX}-waf/CLOUDFRONT"
             
             if ! smart_import "$WAF_RESOURCE" "$WAF_IMPORT_ID" "WAF Web ACL"; then
-              # Import failed - delete and recreate
-              echo "  🔄 Import failed - removing duplicate WAF..."
-              LOCK_TOKEN=$(echo "$WAF_JSON" | jq -r ".WebACLs[] | select(.Name==\"${PREFIX}-waf\") | .LockToken")
-              
-              if [ -n "$LOCK_TOKEN" ]; then
-                # Check if attached to CloudFront
-                ATTACHED=$(aws cloudfront list-distributions --output json 2>/dev/null | \
-                          jq -r ".DistributionList.Items[]? | select(.WebACLId | contains(\"$WAF_ID\")) | .Id" | head -1)
-                
-                if [ -n "$ATTACHED" ]; then
-                  echo "  🔄 Detaching from CloudFront $ATTACHED..."
-                  aws cloudfront get-distribution-config --id "$ATTACHED" > /tmp/dist_waf.json
-                  DIST_ETAG=$(cat /tmp/dist_waf.json | jq -r '.ETag')
-                  
-                  cat /tmp/dist_waf.json | jq '.DistributionConfig.WebACLId = ""' > /tmp/dist_no_waf.json
-                  
-                  aws cloudfront update-distribution \
-                    --id "$ATTACHED" \
-                    --if-match "$DIST_ETAG" \
-                    --distribution-config "$(cat /tmp/dist_no_waf.json | jq -c '.DistributionConfig')" 2>/dev/null || true
-                  
-                  sleep 5
-                fi
-                
-                echo "  🗑️  Deleting duplicate WAF..."
-                aws wafv2 delete-web-acl \
-                  --scope CLOUDFRONT \
-                  --id "$WAF_ID" \
-                  --lock-token "$LOCK_TOKEN" \
-                  --region us-east-1 2>&1 && \
-                echo "  ✅ Deleted - Terraform will create new one" || \
-                echo "  ⚠️  Could not delete"
-              fi
+              # [KEEP YOUR EXISTING WAF CLEANUP CODE HERE]
             fi
           else
             echo "  ℹ️  WAF not found (will be created)"
@@ -671,6 +750,35 @@ jobs:
           DIST_JSON=$(aws cloudfront list-distributions --output json 2>/dev/null || echo '{"DistributionList":{"Items":[]}}')
           DIST_ID=$(echo "$DIST_JSON" | jq -r ".DistributionList.Items[] | select(.Comment==\"${PREFIX} distribution\") | .Id" 2>/dev/null)
           smart_import "aws_cloudfront_distribution.main" "$DIST_ID" "CloudFront Distribution"
+
+          # Import Response Headers Policy if exists
+          echo "📋 Checking for existing Response Headers Policy (${PREFIX}-security-headers)"
+          RHP_ID=$(aws cloudfront list-response-headers-policies --type custom --output json 2>/dev/null | \
+            jq -r --arg name "${PREFIX}-security-headers" '.ResponseHeadersPolicyList.Items[]? |
+              select(.ResponseHeadersPolicy.ResponseHeadersPolicyConfig.Name == $name) | .ResponseHeadersPolicy.Id' | head -1)
+
+          if [ -n "$RHP_ID" ]; then
+            echo "  Found Response Headers Policy id=$RHP_ID, attempting import..."
+            if ! smart_import "aws_cloudfront_response_headers_policy.security_headers" "$RHP_ID" "Response Headers Policy"; then
+              echo "  Import failed. The cleanup step will attempt to detach and delete it so Terraform can recreate it."
+            fi
+          else
+            echo "  No existing Response Headers Policy named ${PREFIX}-security-headers found"
+          fi
+
+          # Import OAC if exists
+          echo "🔒 Checking for existing Origin Access Control (${PREFIX}-oac)"
+          OAC_ID=$(aws cloudfront list-origin-access-controls --output json 2>/dev/null | \
+            jq -r --arg name "${PREFIX}-oac" '.OriginAccessControlList.Items[]? | select(.Name==$name) | .Id' | head -1)
+
+          if [ -n "$OAC_ID" ]; then
+            echo "  Found OAC id=$OAC_ID, attempting import..."
+            if ! smart_import "aws_cloudfront_origin_access_control.website" "$OAC_ID" "Origin Access Control"; then
+              echo "  Import failed. The cleanup step will attempt to detach and delete it so Terraform can recreate it."
+            fi
+          else
+            echo "  No existing OAC named ${PREFIX}-oac found"
+          fi
           
           # Import CloudWatch Dashboard
           echo ""
