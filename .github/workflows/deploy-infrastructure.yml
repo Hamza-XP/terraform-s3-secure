@@ -298,9 +298,49 @@ jobs:
           is_managed() {
             terraform state list 2>/dev/null | grep -q "^$1$"
           }
-          
+
           # ================================================================
-          # 1. CLOUDFRONT ORIGIN ACCESS CONTROLS (OAC) - FIXED
+          # 1. CLOUDFRONT DISTRIBUTIONS
+          # ================================================================
+          echo "☁️  Scanning CloudFront Distributions..."
+
+          aws cloudfront list-distributions --output json 2>/dev/null | \
+          jq -r '.DistributionList.Items[]? | "\(.Id)|\(.Comment)|\(.Status)|\(.Enabled)"' | \
+          while IFS='|' read -r dist_id comment status enabled; do
+            if [[ "$comment" == *"$TARGET_PREFIX"* ]]; then
+              if [ "$comment" = "${TARGET_PREFIX} distribution" ] && is_managed "aws_cloudfront_distribution.main"; then
+                echo "  ✅ $dist_id - Managed"
+              else
+                echo "  🗑️  Orphaned: $dist_id ($comment)"
+                if [ "$enabled" = "true" ]; then
+                  echo "     Disabling..."
+                  aws cloudfront get-distribution-config --id "$dist_id" > /tmp/cf_$dist_id.json 2>/dev/null
+                  ETAG=$(jq -r '.ETag' /tmp/cf_$dist_id.json)
+                  jq '.DistributionConfig.Enabled = false' /tmp/cf_$dist_id.json > /tmp/cf_disabled_$dist_id.json
+                  aws cloudfront update-distribution \
+                    --id "$dist_id" \
+                    --if-match "$ETAG" \
+                    --distribution-config "$(jq -c '.DistributionConfig' /tmp/cf_disabled_$dist_id.json)" \
+                    2>/dev/null && echo "     ✅ Disabled" || echo "     ⚠️  Failed to disable"
+                fi
+                
+                # DELETE the distribution (not just disable)
+                echo "     Deleting distribution..."
+                ETAG=$(aws cloudfront get-distribution --id "$dist_id" --query 'ETag' --output text 2>/dev/null)
+                if [ -n "$ETAG" ]; then
+                  aws cloudfront delete-distribution --id "$dist_id" --if-match "$ETAG" 2>&1 && \
+                  echo "     ✅ Deleted distribution" || echo "     ⚠️  Distribution deletion in progress"
+                fi
+              fi
+            fi
+          done
+
+          # Wait for distributions to be removed
+          echo "     Waiting for CloudFront distributions to be removed..."
+          sleep 5
+
+          # ================================================================
+          # 2. CLOUDFRONT ORIGIN ACCESS CONTROLS (OAC) - FIXED
           # ================================================================
           echo "🔒 Scanning CloudFront Origin Access Controls..."
 
@@ -326,7 +366,7 @@ jobs:
           done
 
           # ================================================================
-          # 2. CLOUDFRONT RESPONSE HEADERS POLICIES
+          # 3. CLOUDFRONT RESPONSE HEADERS POLICIES
           # ================================================================
           echo ""
           echo "📋 Scanning CloudFront Response Headers Policies..."
@@ -347,35 +387,6 @@ jobs:
                   echo "     ✅ Deleted" || echo "     ⚠️  Failed to delete"
                 else
                   echo "     ❌ Could not get ETag for deletion"
-                fi
-              fi
-            fi
-          done
-          
-          # ================================================================
-          # 3. CLOUDFRONT DISTRIBUTIONS
-          # ================================================================
-          echo ""
-          echo "☁️  Scanning CloudFront Distributions..."
-          
-          aws cloudfront list-distributions --output json 2>/dev/null | \
-          jq -r '.DistributionList.Items[]? | "\(.Id)|\(.Comment)|\(.Status)|\(.Enabled)"' | \
-          while IFS='|' read -r dist_id comment status enabled; do
-            if [[ "$comment" == *"$TARGET_PREFIX"* ]]; then
-              if [ "$comment" = "${TARGET_PREFIX} distribution" ] && is_managed "aws_cloudfront_distribution.main"; then
-                echo "  ✅ $dist_id - Managed"
-              else
-                echo "  🗑️  Orphaned: $dist_id ($comment)"
-                if [ "$enabled" = "true" ]; then
-                  echo "     Disabling..."
-                  aws cloudfront get-distribution-config --id "$dist_id" > /tmp/cf_$dist_id.json 2>/dev/null
-                  ETAG=$(jq -r '.ETag' /tmp/cf_$dist_id.json)
-                  jq '.DistributionConfig.Enabled = false' /tmp/cf_$dist_id.json > /tmp/cf_disabled_$dist_id.json
-                  aws cloudfront update-distribution \
-                    --id "$dist_id" \
-                    --if-match "$ETAG" \
-                    --distribution-config "$(jq -c '.DistributionConfig' /tmp/cf_disabled_$dist_id.json)" \
-                    2>/dev/null && echo "     ✅ Disabled" || echo "     ⚠️  Failed"
                 fi
               fi
             fi
