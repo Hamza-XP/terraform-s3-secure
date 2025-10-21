@@ -192,6 +192,11 @@ resource "aws_cloudwatch_log_group" "waf_logs" {
     Environment = var.environment
     Purpose     = "WAF Request Logs"
   }
+  
+  # Prevent recreation if log group already exists
+  lifecycle {
+    ignore_changes = [name]
+  }
 }
 
 resource "aws_s3_bucket_ownership_controls" "logs" {
