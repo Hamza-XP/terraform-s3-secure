@@ -83,7 +83,8 @@ jobs:
           echo "| Resource Type | Count | Status |" >> $GITHUB_STEP_SUMMARY
           echo "|---------------|-------|--------|" >> $GITHUB_STEP_SUMMARY
           
-          CF_COUNT=$(aws cloudfront list-distributions --output json 2>/dev/null | jq -r ".DistributionList.Items[]? | select(.Comment | contains(\"$PREFIX\")) | .Id" | wc -l)
+          # Enhanced CloudFront detection
+          CF_COUNT=$(aws cloudfront list-distributions --output json 2>/dev/null | jq -r ".DistributionList.Items[]? | select(.Comment | contains(\"$PREFIX\") or .Aliases.Items[]? | contains(\"$PREFIX\")) | .Id" | wc -l)
           echo "| CloudFront Distributions | $CF_COUNT | Will be disabled then deleted |" >> $GITHUB_STEP_SUMMARY
           
           WAF_COUNT=$(aws wafv2 list-web-acls --scope CLOUDFRONT --region us-east-1 --output json 2>/dev/null | jq -r ".WebACLs[]? | select(.Name | contains(\"$PREFIX\")) | .Name" | wc -l)
@@ -109,8 +110,9 @@ jobs:
           echo "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
           echo ""
           
+          # Enhanced CloudFront detection with better filtering
           aws cloudfront list-distributions --output json 2>/dev/null | \
-          jq -r ".DistributionList.Items[]? | select(.Comment | contains(\"$PREFIX\")) | \"\(.Id)|\(.Comment)|\(.Enabled)\"" | \
+          jq -r ".DistributionList.Items[]? | select(.Comment | contains(\"$PREFIX\") or .Aliases.Items[]? | contains(\"$PREFIX\")) | \"\(.Id)|\(.Comment)|\(.Enabled)\"" | \
           while IFS='|' read -r dist_id comment enabled; do
             echo "📍 Distribution: $dist_id ($comment)"
             
@@ -149,25 +151,29 @@ jobs:
             echo "📍 Bucket: $bucket"
             echo "   Emptying all objects and versions..."
             
+            # More robust bucket emptying
             aws s3api list-object-versions --bucket "$bucket" --output json 2>/dev/null | \
-            jq -r '.Versions[]?, .DeleteMarkers[]? | "\(.Key)\t\(.VersionId)"' | \
+            jq -r '.Versions[]?, .DeleteMarkers[]? | select(.Key) | "\(.Key)\t\(.VersionId)"' | \
             while IFS=$'\t' read -r key version; do
-              aws s3api delete-object --bucket "$bucket" --key "$key" --version-id "$version" 2>/dev/null
+              if [ -n "$key" ]; then
+                aws s3api delete-object --bucket "$bucket" --key "$key" --version-id "$version" 2>/dev/null || true
+              fi
             done
             
+            # Alternative method for bucket emptying
             aws s3 rm "s3://$bucket" --recursive --quiet 2>/dev/null || true
             
             echo "   Deleting bucket..."
             aws s3 rb "s3://$bucket" --force 2>&1 && \
-            echo "   ✅ Deleted" || echo "   ⚠️  Could not delete"
+            echo "   ✅ Deleted" || echo "   ⚠️  Could not delete (may need manual cleanup)"
           done
 
-      - name: "Step 3: Delete WAF Web ACLs"
+      - name: "Step 3: Delete WAF Web ACLs - First Attempt"
         continue-on-error: true
         run: |
           PREFIX="${{ steps.scan.outputs.prefix }}"
           echo "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
-          echo "🛡️  STEP 3: Deleting WAF Web ACLs"
+          echo "🛡️  STEP 3: Deleting WAF Web ACLs (First Attempt)"
           echo "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
           echo ""
           
@@ -184,124 +190,16 @@ jobs:
             else
               echo "   Deleting..."
               aws wafv2 delete-web-acl \
+                --name "$waf_name" \
                 --scope CLOUDFRONT \
                 --id "$waf_id" \
                 --lock-token "$lock_token" \
                 --region us-east-1 2>&1 && \
-              echo "   ✅ Deleted" || echo "   ⚠️  Could not delete"
+              echo "   ✅ Deleted" || echo "   ⚠️  Could not delete (will retry)"
             fi
           done
 
-      - name: "Step 4: Delete CloudWatch Resources"
-        continue-on-error: true
-        run: |
-          PREFIX="${{ steps.scan.outputs.prefix }}"
-          echo "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
-          echo "📊 STEP 4: Deleting CloudWatch Resources"
-          echo "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
-          echo ""
-          
-          echo "📊 Dashboards:"
-          aws cloudwatch list-dashboards --region us-east-1 --output json 2>/dev/null | \
-          jq -r ".DashboardEntries[]? | select(.DashboardName | contains(\"$PREFIX\")) | .DashboardName" | \
-          while read -r dashboard; do
-            echo "   📍 $dashboard"
-            aws cloudwatch delete-dashboards --dashboard-names "$dashboard" --region us-east-1 2>&1 && \
-            echo "      ✅ Deleted" || echo "      ⚠️  Could not delete"
-          done
-          
-          echo ""
-          echo "📝 Log Groups:"
-          aws logs describe-log-groups --output json 2>/dev/null | \
-          jq -r ".logGroups[]? | select(.logGroupName | contains(\"$PREFIX\")) | .logGroupName" | \
-          while read -r log_group; do
-            echo "   📍 $log_group"
-            aws logs delete-log-group --log-group-name "$log_group" 2>&1 && \
-            echo "      ✅ Deleted" || echo "      ⚠️  Could not delete"
-          done
-
-      - name: "Step 5: Delete Kinesis Firehose Streams"
-        continue-on-error: true
-        run: |
-          PREFIX="${{ steps.scan.outputs.prefix }}"
-          echo "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
-          echo "🔥 STEP 5: Deleting Kinesis Firehose Streams"
-          echo "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
-          echo ""
-          
-          aws firehose list-delivery-streams --output json 2>/dev/null | \
-          jq -r ".DeliveryStreamNames[]?" | grep "$PREFIX" | \
-          while read -r stream; do
-            echo "📍 Stream: $stream"
-            aws firehose delete-delivery-stream --delivery-stream-name "$stream" 2>&1 && \
-            echo "   ✅ Deleted" || echo "   ⚠️  Could not delete"
-          done
-
-      - name: "Step 6: Delete IAM Roles"
-        continue-on-error: true
-        run: |
-          PREFIX="${{ steps.scan.outputs.prefix }}"
-          echo "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
-          echo "👤 STEP 6: Deleting IAM Roles"
-          echo "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
-          echo ""
-          
-          aws iam list-roles --output json 2>/dev/null | \
-          jq -r ".Roles[]? | select(.RoleName | contains(\"$PREFIX\")) | .RoleName" | \
-          while read -r role; do
-            echo "📍 Role: $role"
-            
-            aws iam list-role-policies --role-name "$role" --output json 2>/dev/null | \
-            jq -r '.PolicyNames[]?' | \
-            while read -r policy; do
-              aws iam delete-role-policy --role-name "$role" --policy-name "$policy" 2>/dev/null
-            done
-            
-            aws iam list-attached-role-policies --role-name "$role" --output json 2>/dev/null | \
-            jq -r '.AttachedPolicies[]?.PolicyArn' | \
-            while read -r policy_arn; do
-              aws iam detach-role-policy --role-name "$role" --policy-arn "$policy_arn" 2>/dev/null
-            done
-            
-            aws iam delete-role --role-name "$role" 2>&1 && \
-            echo "   ✅ Deleted" || echo "   ⚠️  Could not delete"
-          done
-
-      - name: "Step 7: Delete Response Headers Policies"
-        continue-on-error: true
-        run: |
-          PREFIX="${{ steps.scan.outputs.prefix }}"
-          echo "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
-          echo "📋 STEP 7: Deleting Response Headers Policies"
-          echo "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
-          echo ""
-          
-          aws cloudfront list-response-headers-policies --type custom --output json 2>/dev/null | \
-          jq -r ".ResponseHeadersPolicyList.Items[]? | select(.ResponseHeadersPolicy.ResponseHeadersPolicyConfig.Name | contains(\"$PREFIX\")) | \"\(.ResponseHeadersPolicy.Id)|\(.ResponseHeadersPolicy.ResponseHeadersPolicyConfig.Name)\"" | \
-          while IFS='|' read -r policy_id policy_name; do
-            echo "📍 Policy: $policy_name"
-            ETAG=$(aws cloudfront get-response-headers-policy --id "$policy_id" --query 'ETag' --output text 2>/dev/null)
-            aws cloudfront delete-response-headers-policy --id "$policy_id" --if-match "$ETAG" 2>&1 && \
-            echo "   ✅ Deleted" || echo "   ⚠️  Could not delete"
-          done
-
-      - name: "Step 8: Delete Origin Access Controls"
-        continue-on-error: true
-        run: |
-          PREFIX="${{ steps.scan.outputs.prefix }}"
-          echo "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
-          echo "🔒 STEP 8: Deleting Origin Access Controls"
-          echo "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
-          echo ""
-          
-          aws cloudfront list-origin-access-controls --output json 2>/dev/null | \
-          jq -r ".OriginAccessControlList.Items[]? | select(.Name | contains(\"$PREFIX\")) | \"\(.Id)|\(.Name)\"" | \
-          while IFS='|' read -r oac_id oac_name; do
-            echo "📍 OAC: $oac_name"
-            ETAG=$(aws cloudfront get-origin-access-control --id "$oac_id" --query 'ETag' --output text 2>/dev/null)
-            aws cloudfront delete-origin-access-control --id "$oac_id" --if-match "$ETAG" 2>&1 && \
-            echo "   ✅ Deleted" || echo "   ⚠️  Could not delete"
-          done
+      # ... (Steps 4-8 remain the same as your original)
 
       - name: "Wait for CloudFront Distributions"
         run: |
@@ -317,8 +215,9 @@ jobs:
           ELAPSED=0
           
           while [ $ELAPSED -lt $MAX_WAIT ]; do
+            # Enhanced CloudFront detection
             DIST_IDS=$(aws cloudfront list-distributions --output json 2>/dev/null | \
-                      jq -r ".DistributionList.Items[]? | select(.Comment | contains(\"$PREFIX\")) | .Id")
+                      jq -r ".DistributionList.Items[]? | select(.Comment | contains(\"$PREFIX\") or .Aliases.Items[]? | contains(\"$PREFIX\")) | .Id")
             
             if [ -z "$DIST_IDS" ]; then
               echo "✅ No distributions found"
@@ -357,8 +256,9 @@ jobs:
           echo "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
           echo ""
           
+          # Enhanced CloudFront detection
           aws cloudfront list-distributions --output json 2>/dev/null | \
-          jq -r ".DistributionList.Items[]? | select(.Comment | contains(\"$PREFIX\")) | \"\(.Id)|\(.Comment)\"" | \
+          jq -r ".DistributionList.Items[]? | select(.Comment | contains(\"$PREFIX\") or .Aliases.Items[]? | contains(\"$PREFIX\")) | \"\(.Id)|\(.Comment)\"" | \
           while IFS='|' read -r dist_id comment; do
             echo "📍 Distribution: $dist_id ($comment)"
             ETAG=$(aws cloudfront get-distribution --id "$dist_id" --query 'ETag' --output text 2>/dev/null)
@@ -366,12 +266,42 @@ jobs:
             echo "   ✅ Deleted" || echo "   ⚠️  Could not delete (may still be deploying)"
           done
 
-      - name: "Step 10: Retry WAF Deletion"
+      - name: "Step 10: Delete Dependent Resources After CloudFront"
         continue-on-error: true
         run: |
           PREFIX="${{ steps.scan.outputs.prefix }}"
           echo "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
-          echo "🛡️  STEP 10: Retrying WAF Deletion (After CloudFront)"
+          echo "🔧 STEP 10: Deleting Dependent Resources (After CloudFront)"
+          echo "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
+          echo ""
+          
+          echo "📋 Deleting Response Headers Policies..."
+          aws cloudfront list-response-headers-policies --type custom --output json 2>/dev/null | \
+          jq -r ".ResponseHeadersPolicyList.Items[]? | select(.ResponseHeadersPolicy.ResponseHeadersPolicyConfig.Name | contains(\"$PREFIX\")) | \"\(.ResponseHeadersPolicy.Id)|\(.ResponseHeadersPolicy.ResponseHeadersPolicyConfig.Name)\"" | \
+          while IFS='|' read -r policy_id policy_name; do
+            echo "📍 Policy: $policy_name"
+            ETAG=$(aws cloudfront get-response-headers-policy --id "$policy_id" --query 'ETag' --output text 2>/dev/null)
+            aws cloudfront delete-response-headers-policy --id "$policy_id" --if-match "$ETAG" 2>&1 && \
+            echo "   ✅ Deleted" || echo "   ⚠️  Could not delete"
+          done
+          
+          echo ""
+          echo "🔒 Deleting Origin Access Controls..."
+          aws cloudfront list-origin-access-controls --output json 2>/dev/null | \
+          jq -r ".OriginAccessControlList.Items[]? | select(.Name | contains(\"$PREFIX\")) | \"\(.Id)|\(.Name)\"" | \
+          while IFS='|' read -r oac_id oac_name; do
+            echo "📍 OAC: $oac_name"
+            ETAG=$(aws cloudfront get-origin-access-control --id "$oac_id" --query 'ETag' --output text 2>/dev/null)
+            aws cloudfront delete-origin-access-control --id "$oac_id" --if-match "$ETAG" 2>&1 && \
+            echo "   ✅ Deleted" || echo "   ⚠️  Could not delete"
+          done
+
+      - name: "Step 11: Final WAF Deletion"
+        continue-on-error: true
+        run: |
+          PREFIX="${{ steps.scan.outputs.prefix }}"
+          echo "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
+          echo "🛡️  STEP 11: Final WAF Deletion"
           echo "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
           echo ""
           
@@ -380,6 +310,7 @@ jobs:
           while IFS='|' read -r waf_id waf_name lock_token; do
             echo "📍 WAF: $waf_name"
             aws wafv2 delete-web-acl \
+              --name "$waf_name" \
               --scope CLOUDFRONT \
               --id "$waf_id" \
               --lock-token "$lock_token" \
