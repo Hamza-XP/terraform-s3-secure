@@ -105,66 +105,68 @@ jobs:
           
           echo "" >> $GITHUB_STEP_SUMMARY
 
-      - name: "Step 1: Disable and Delete CloudFront Distributions"
+      - name: "Step 1: Disable CloudFront Distributions"
         continue-on-error: true
         run: |
-            PROJECT_NAME="${{ steps.scan.outputs.project_name }}"
-            PREFIX="${{ steps.scan.outputs.prefix }}"
-            
-            echo "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
-            echo "☁️  STEP 1: Disabling and Deleting CloudFront Distributions"
-            echo "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
+          PROJECT_NAME="${{ steps.scan.outputs.project_name }}"
+          PREFIX="${{ steps.scan.outputs.prefix }}"
+          
+          echo "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
+          echo "☁️  STEP 1: Disabling CloudFront Distributions"
+          echo "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
+          echo ""
+          
+          # Use direct detection since PROJECT_NAME might be empty
+          DISTRIBUTIONS=$(aws cloudfront list-distributions --output json 2>/dev/null | \
+            jq -r ".DistributionList.Items[]? | select(.Comment != null) | select(.Comment | contains(\"secure-website\")) | \"\(.Id)|\(.Comment)|\(.Enabled)|\(.Status)\"" 2>/dev/null || true)
+          
+          if [ -z "$DISTRIBUTIONS" ]; then
+            echo "❌ No CloudFront distributions found"
+          else
+            echo "📍 Found distributions:"
+            echo "$DISTRIBUTIONS" | while IFS='|' read -r dist_id comment enabled status; do
+              echo "   🔸 $dist_id - $comment (Enabled: $enabled, Status: $status)"
+            done
             echo ""
-            echo "🔍 Using PROJECT_NAME: $PROJECT_NAME"
-            echo "🔍 Using PREFIX: $PREFIX"
             
-            # Use the EXACT SAME detection logic as the scan step
-            DISTRIBUTIONS=$(aws cloudfront list-distributions --output json 2>/dev/null | \
-              jq -r ".DistributionList.Items[]? | select(.Comment != null) | select(.Comment | contains(\"$PROJECT_NAME\")) | \"\(.Id)|\(.Comment)|\(.Enabled)|\(.Status)\"" 2>/dev/null || true)
-            
-            if [ -z "$DISTRIBUTIONS" ]; then
-              echo "❌ No CloudFront distributions found with PROJECT_NAME: $PROJECT_NAME"
-              echo "💡 Trying alternative detection by origin domain..."
-              
-              # Alternative detection by origin domain
-              DISTRIBUTIONS=$(aws cloudfront list-distributions --output json 2>/dev/null | \
-                jq -r ".DistributionList.Items[]? | .Id as \$id | .Comment as \$comment | .Origins.Items[]? | select(.DomainName != null) | select(.DomainName | contains(\"$PREFIX\")) | \"\$id|\$comment|unknown|unknown\"" 2>/dev/null || true)
-            fi
-            
-            if [ -z "$DISTRIBUTIONS" ]; then
-              echo "❌ No CloudFront distributions found with either method."
-            else
-              echo "📍 Found distributions using the same logic as scan:"
-              echo "$DISTRIBUTIONS" | while IFS='|' read -r dist_id comment enabled status; do
-                echo "   🔸 $dist_id - $comment (Enabled: $enabled, Status: $status)"
-              done
-              echo ""
-              
-              # Disable distributions
-              echo "$DISTRIBUTIONS" | while IFS='|' read -r dist_id comment enabled status; do
-                if [ "$enabled" = "true" ]; then
-                  echo "📍 Disabling: $dist_id"
+            # Disable enabled distributions with retry logic
+            echo "$DISTRIBUTIONS" | while IFS='|' read -r dist_id comment enabled status; do
+              if [ "$enabled" = "true" ]; then
+                echo "📍 Attempting to disable: $dist_id"
+                
+                # Try multiple times with increasing delays
+                for attempt in 1 2 3; do
+                  echo "   Attempt $attempt to disable..."
                   aws cloudfront get-distribution-config --id "$dist_id" > /tmp/cf_$dist_id.json 2>/dev/null
                   if [ $? -eq 0 ]; then
                     ETAG=$(jq -r '.ETag' /tmp/cf_$dist_id.json)
                     jq '.DistributionConfig.Enabled = false' /tmp/cf_$dist_id.json > /tmp/cf_disabled_$dist_id.json
-                    aws cloudfront update-distribution \
+                    
+                    if aws cloudfront update-distribution \
                       --id "$dist_id" \
                       --if-match "$ETAG" \
                       --distribution-config "$(jq -c '.DistributionConfig' /tmp/cf_disabled_$dist_id.json)" \
-                      >/dev/null 2>&1 && echo "   ✅ Disabled" || echo "   ❌ Failed to disable"
+                      >/dev/null 2>&1; then
+                      echo "   ✅ Disable command accepted"
+                      break
+                    else
+                      echo "   ⚠️  Disable attempt $attempt failed"
+                      sleep 10
+                    fi
                   else
                     echo "   ❌ Could not get distribution config"
+                    break
                   fi
-                else
-                  echo "📍 Already disabled: $dist_id"
-                fi
-              done
-              
-              echo ""
-              echo "⏳ Waiting 60 seconds for disable operations to start..."
-              sleep 60
-            fi
+                done
+              else
+                echo "📍 Already disabled: $dist_id"
+              fi
+            done
+            
+            echo ""
+            echo "⏳ Waiting 60 seconds for disable operations to propagate..."
+            sleep 60
+          fi
 
       - name: "Step 2: Empty and Delete S3 Buckets"
         continue-on-error: true
@@ -356,7 +358,7 @@ jobs:
               echo "📝 Note: CloudFront deletions can take 15-20 minutes to complete."
               echo "   The distributions will disappear from the console when fully deleted."
             fi
-            
+
       - name: "Verify CloudFront Deletion"
         continue-on-error: true
         run: |
