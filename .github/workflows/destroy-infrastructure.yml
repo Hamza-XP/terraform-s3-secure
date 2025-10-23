@@ -67,11 +67,8 @@ jobs:
       - name: Scan for Resources to Destroy
         id: scan
         run: |
-          if [ "${{ github.event.inputs.environment }}" = "production" ]; then
-            PREFIX="secure-website-production"
-          else
-            PREFIX="secure-website-staging"
-          fi
+          PROJECT_NAME=$(grep -E '^project_name\s*=' terraform/terraform.tfvars | cut -d '"' -f2)
+          PREFIX="${PROJECT_NAME}-${{ github.event.inputs.environment }}-waf"
           
           echo "prefix=$PREFIX" >> $GITHUB_OUTPUT
           
