@@ -68,7 +68,7 @@ jobs:
         id: scan
         run: |
           PROJECT_NAME=$(grep -E '^project_name\s*=' terraform/terraform.tfvars | cut -d '"' -f2)
-          PREFIX="${PROJECT_NAME}-${{ github.event.inputs.environment }}-waf"
+          PREFIX="${PROJECT_NAME}-${{ github.event.inputs.environment }}"
           
           echo "prefix=$PREFIX" >> $GITHUB_OUTPUT
           
@@ -79,12 +79,19 @@ jobs:
           echo "" >> $GITHUB_STEP_SUMMARY
           echo "| Resource Type | Count | Status |" >> $GITHUB_STEP_SUMMARY
           echo "|---------------|-------|--------|" >> $GITHUB_STEP_SUMMARY
-          
-          # Improved CloudFront detection
-          CF_COUNT=$(aws cloudfront list-distributions --output json 2>/dev/null | jq -r ".DistributionList.Items[]? | select(.Comment != null) | select(.Comment | contains(\"$PREFIX\")) | .Id" | wc -l)
+
+          # IMPROVED CloudFront detection - uses PROJECT_NAME for comment matching
+          CF_DISTRIBUTIONS=$(aws cloudfront list-distributions --output json 2>/dev/null | jq -r ".DistributionList.Items[]? | select(.Comment != null) | select(.Comment | contains(\"$PROJECT_NAME\")) | .Id" 2>/dev/null || true)
+          CF_COUNT=$(echo "$CF_DISTRIBUTIONS" | grep -v '^$' | wc -l)
           echo "| CloudFront Distributions | $CF_COUNT | Will be disabled then deleted |" >> $GITHUB_STEP_SUMMARY
+    
+          # Also check by origin domain as backup
+          CF_ORIGIN_COUNT=$(aws cloudfront list-distributions --output json 2>/dev/null | jq -r ".DistributionList.Items[]? | .Origins.Items[]? | select(.DomainName != null) | select(.DomainName | contains(\"$PREFIX\")) | .Id" | sort -u | wc -l)
+          if [ $CF_ORIGIN_COUNT -gt 0 ]; then
+            echo "| CloudFront (by origin) | $CF_ORIGIN_COUNT | Additional detection method |" >> $GITHUB_STEP_SUMMARY
+          fi
           
-          WAF_COUNT=$(aws wafv2 list-web-acls --scope CLOUDFRONT --region us-east-1 --output json 2>/dev/null | jq -r ".WebACLs[]? | select(.Name | contains(\"$PREFIX\")) | .Name" | wc -l)
+          WAF_COUNT=$(aws wafv2 list-web-acls --scope CLOUDFRONT --region us-east-1 --output json 2>/dev/null | jq -r ".WebACLs[]? | select(.Name | contains(\"$PREFIX-waf\")) | .Name" | wc -l)
           echo "| WAF Web ACLs | $WAF_COUNT | Will be deleted |" >> $GITHUB_STEP_SUMMARY
           
           S3_COUNT=$(aws s3api list-buckets --output json 2>/dev/null | jq -r ".Buckets[]? | select(.Name | contains(\"$PREFIX\")) | .Name" | wc -l)
@@ -98,45 +105,66 @@ jobs:
           
           echo "" >> $GITHUB_STEP_SUMMARY
 
-      - name: "Step 1: Disable CloudFront Distributions"
+      - name: "Step 1: Disable and Delete CloudFront Distributions"
         continue-on-error: true
         run: |
-          PREFIX="${{ steps.scan.outputs.prefix }}"
-          echo "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
-          echo "☁️  STEP 1: Disabling CloudFront Distributions"
-          echo "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
-          echo ""
-          
-          # Improved CloudFront detection with null check
-          DISTRIBUTIONS=$(aws cloudfront list-distributions --output json 2>/dev/null | \
-            jq -r ".DistributionList.Items[]? | select(.Comment != null) | select(.Comment | contains(\"$PREFIX\")) | \"\(.Id)|\(.Comment)|\(.Enabled)\"" 2>/dev/null || true)
-          
-          if [ -z "$DISTRIBUTIONS" ]; then
-            echo "ℹ️  No CloudFront distributions found with prefix: $PREFIX"
-          else
-            echo "$DISTRIBUTIONS" | while IFS='|' read -r dist_id comment enabled; do
-              echo "📍 Distribution: $dist_id ($comment)"
-              
-              if [ "$enabled" = "true" ]; then
-                echo "   Disabling..."
-                aws cloudfront get-distribution-config --id "$dist_id" > /tmp/cf_$dist_id.json 2>/dev/null
-                ETAG=$(jq -r '.ETag' /tmp/cf_$dist_id.json)
-                jq '.DistributionConfig.Enabled = false' /tmp/cf_$dist_id.json > /tmp/cf_disabled_$dist_id.json
-                
-                aws cloudfront update-distribution \
-                  --id "$dist_id" \
-                  --if-match "$ETAG" \
-                  --distribution-config "$(jq -c '.DistributionConfig' /tmp/cf_disabled_$dist_id.json)" \
-                  2>/dev/null && echo "   ✅ Disabled" || echo "   ⚠️  Already disabled"
-              else
-                echo "   ✅ Already disabled"
-              fi
-            done
+            PROJECT_NAME="${{ steps.scan.outputs.project_name }}"
+            PREFIX="${{ steps.scan.outputs.prefix }}"
             
+            echo "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
+            echo "☁️  STEP 1: Disabling and Deleting CloudFront Distributions"
+            echo "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
             echo ""
-            echo "⏳ Waiting 30 seconds for distributions to start disabling..."
-            sleep 30
-          fi
+            echo "🔍 Using PROJECT_NAME: $PROJECT_NAME"
+            echo "🔍 Using PREFIX: $PREFIX"
+            
+            # Use the EXACT SAME detection logic as the scan step
+            DISTRIBUTIONS=$(aws cloudfront list-distributions --output json 2>/dev/null | \
+              jq -r ".DistributionList.Items[]? | select(.Comment != null) | select(.Comment | contains(\"$PROJECT_NAME\")) | \"\(.Id)|\(.Comment)|\(.Enabled)|\(.Status)\"" 2>/dev/null || true)
+            
+            if [ -z "$DISTRIBUTIONS" ]; then
+              echo "❌ No CloudFront distributions found with PROJECT_NAME: $PROJECT_NAME"
+              echo "💡 Trying alternative detection by origin domain..."
+              
+              # Alternative detection by origin domain
+              DISTRIBUTIONS=$(aws cloudfront list-distributions --output json 2>/dev/null | \
+                jq -r ".DistributionList.Items[]? | .Id as \$id | .Comment as \$comment | .Origins.Items[]? | select(.DomainName != null) | select(.DomainName | contains(\"$PREFIX\")) | \"\$id|\$comment|unknown|unknown\"" 2>/dev/null || true)
+            fi
+            
+            if [ -z "$DISTRIBUTIONS" ]; then
+              echo "❌ No CloudFront distributions found with either method."
+            else
+              echo "📍 Found distributions using the same logic as scan:"
+              echo "$DISTRIBUTIONS" | while IFS='|' read -r dist_id comment enabled status; do
+                echo "   🔸 $dist_id - $comment (Enabled: $enabled, Status: $status)"
+              done
+              echo ""
+              
+              # Disable distributions
+              echo "$DISTRIBUTIONS" | while IFS='|' read -r dist_id comment enabled status; do
+                if [ "$enabled" = "true" ]; then
+                  echo "📍 Disabling: $dist_id"
+                  aws cloudfront get-distribution-config --id "$dist_id" > /tmp/cf_$dist_id.json 2>/dev/null
+                  if [ $? -eq 0 ]; then
+                    ETAG=$(jq -r '.ETag' /tmp/cf_$dist_id.json)
+                    jq '.DistributionConfig.Enabled = false' /tmp/cf_$dist_id.json > /tmp/cf_disabled_$dist_id.json
+                    aws cloudfront update-distribution \
+                      --id "$dist_id" \
+                      --if-match "$ETAG" \
+                      --distribution-config "$(jq -c '.DistributionConfig' /tmp/cf_disabled_$dist_id.json)" \
+                      >/dev/null 2>&1 && echo "   ✅ Disabled" || echo "   ❌ Failed to disable"
+                  else
+                    echo "   ❌ Could not get distribution config"
+                  fi
+                else
+                  echo "📍 Already disabled: $dist_id"
+                fi
+              done
+              
+              echo ""
+              echo "⏳ Waiting 60 seconds for disable operations to start..."
+              sleep 60
+            fi
 
       - name: "Step 2: Empty and Delete S3 Buckets"
         continue-on-error: true
@@ -211,8 +239,6 @@ jobs:
             done
           fi
 
-      # ... (other steps remain similar but with improved error handling)
-
       - name: "Wait for CloudFront Distributions"
         run: |
           PREFIX="${{ steps.scan.outputs.prefix }}"
@@ -272,29 +298,88 @@ jobs:
       - name: "Step 9: Delete CloudFront Distributions"
         continue-on-error: true
         run: |
-          PREFIX="${{ steps.scan.outputs.prefix }}"
-          echo "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
-          echo "☁️  STEP 9: Deleting CloudFront Distributions"
-          echo "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
-          echo ""
-          
-          DISTRIBUTIONS=$(aws cloudfront list-distributions --output json 2>/dev/null | \
-            jq -r ".DistributionList.Items[]? | select(.Comment != null) | select(.Comment | contains(\"$PREFIX\")) | \"\(.Id)|\(.Comment)\"" 2>/dev/null || true)
-          
-          if [ -z "$DISTRIBUTIONS" ]; then
-            echo "ℹ️  No CloudFront distributions found with prefix: $PREFIX"
-          else
-            echo "$DISTRIBUTIONS" | while IFS='|' read -r dist_id comment; do
-              echo "📍 Distribution: $dist_id ($comment)"
-              ETAG=$(aws cloudfront get-distribution --id "$dist_id" --query 'ETag' --output text 2>/dev/null || echo "")
-              if [ -n "$ETAG" ]; then
-                aws cloudfront delete-distribution --id "$dist_id" --if-match "$ETAG" 2>&1 | grep -v "error" && \
-                echo "   ✅ Deleted" || echo "   ⚠️  Could not delete (may still be deploying)"
-              else
-                echo "   ❌ Could not get ETag for distribution"
-              fi
-            done
-          fi
+            PROJECT_NAME="${{ steps.scan.outputs.project_name }}"
+            PREFIX="${{ steps.scan.outputs.prefix }}"
+            
+            echo "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
+            echo "☁️  STEP 9: Deleting CloudFront Distributions"
+            echo "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
+            echo ""
+            echo "🔍 Using PROJECT_NAME: $PROJECT_NAME for detection"
+            
+            # Use the SAME detection logic as Step 1 and scan - by PROJECT_NAME in comment
+            DISTRIBUTIONS=$(aws cloudfront list-distributions --output json 2>/dev/null | \
+              jq -r ".DistributionList.Items[]? | select(.Comment != null) | select(.Comment | contains(\"$PROJECT_NAME\")) | \"\(.Id)|\(.Comment)|\(.Status)\"" 2>/dev/null || true)
+            
+            if [ -z "$DISTRIBUTIONS" ]; then
+              echo "❌ No distributions found by comment. Trying origin domain detection..."
+              # Fallback: detect by origin domain
+              DISTRIBUTIONS=$(aws cloudfront list-distributions --output json 2>/dev/null | \
+                jq -r ".DistributionList.Items[]? | .Id as \$id | .Comment as \$comment | .Origins.Items[]? | select(.DomainName != null) | select(.DomainName | contains(\"$PREFIX\")) | \"\$id|\$comment|unknown\"" 2>/dev/null || true)
+            fi
+            
+            if [ -z "$DISTRIBUTIONS" ]; then
+              echo "❌ No CloudFront distributions found for deletion."
+              echo "💡 Manual deletion may be required for: E191G2X7VOQUCR, E39ARSICL9MJ2Q, E2D8L23FW0GDEQ, E35EJ3YWAN0M0S, E2T09YD9M9AYYO"
+            else
+              echo "📍 Found distributions for deletion:"
+              echo "$DISTRIBUTIONS" | while IFS='|' read -r dist_id comment status; do
+                echo "   🔸 $dist_id - $comment (Status: $status)"
+              done
+              echo ""
+              
+              echo "🗑️  Deleting CloudFront distributions..."
+              echo "$DISTRIBUTIONS" | while IFS='|' read -r dist_id comment status; do
+                echo "📍 Deleting: $dist_id ($comment)"
+                
+                # Get the ETag and delete
+                ETAG=$(aws cloudfront get-distribution --id "$dist_id" --query 'ETag' --output text 2>/dev/null)
+                if [ -n "$ETAG" ]; then
+                  # Attempt deletion
+                  if aws cloudfront delete-distribution --id "$dist_id" --if-match "$ETAG" 2>/dev/null; then
+                    echo "   ✅ Deletion initiated successfully"
+                  else
+                    # Check if it's still deploying
+                    CURRENT_STATUS=$(aws cloudfront get-distribution --id "$dist_id" --query 'Distribution.Status' --output text 2>/dev/null || echo "Unknown")
+                    if [ "$CURRENT_STATUS" = "InProgress" ]; then
+                      echo "   ⏳ Still deploying, will be deleted on next run"
+                    else
+                      echo "   ❌ Failed to delete (Status: $CURRENT_STATUS)"
+                    fi
+                  fi
+                else
+                  echo "   ❌ Could not get ETag for distribution"
+                fi
+              done
+              
+              echo ""
+              echo "📝 Note: CloudFront deletions can take 15-20 minutes to complete."
+              echo "   The distributions will disappear from the console when fully deleted."
+            fi
+            
+      - name: "Verify CloudFront Deletion"
+        continue-on-error: true
+        run: |
+            PROJECT_NAME="${{ steps.scan.outputs.project_name }}"
+            echo "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
+            echo "✅ VERIFY: CloudFront Deletion Status"
+            echo "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
+            echo ""
+            
+            # Check remaining distributions
+            REMAINING_DISTRIBUTIONS=$(aws cloudfront list-distributions --output json 2>/dev/null | \
+              jq -r ".DistributionList.Items[]? | select(.Comment != null) | select(.Comment | contains(\"$PROJECT_NAME\")) | \"\(.Id)|\(.Comment)|\(.Status)\"" 2>/dev/null || true)
+            
+            if [ -z "$REMAINING_DISTRIBUTIONS" ]; then
+              echo "🎉 SUCCESS: All CloudFront distributions have been deleted!"
+            else
+              echo "⚠️  Some distributions are still present:"
+              echo "$REMAINING_DISTRIBUTIONS" | while IFS='|' read -r dist_id comment status; do
+                echo "   🔸 $dist_id - $comment (Status: $status)"
+              done
+              echo ""
+              echo "💡 CloudFront deletions can take 15-20 minutes. Run this workflow again if needed."
+            fi
 
       - name: "Step 10: Retry WAF Deletion"
         continue-on-error: true
