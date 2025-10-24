@@ -68,7 +68,7 @@ jobs:
         id: scan
         run: |
           TF_DIR="${{ steps.detect.outputs.dir }}"
-          PROJECT_NAME=$(grep -E '^project_name\s*=' "$TF_DIR/terraform.tfvars" | cut -d '"' -f2)
+          PROJECT_NAME=$(grep -E '^project_name\s*=' "terraform/terraform.tfvars" | cut -d '"' -f2)
           PREFIX="${PROJECT_NAME}-${{ github.event.inputs.environment }}"
           
           echo "prefix=$PREFIX" >> $GITHUB_OUTPUT
