@@ -134,7 +134,7 @@ jobs:
           # Use direct detection with the exact pattern from your deploy script
           echo "🔍 Scanning for CloudFront distributions..."
           DISTRIBUTIONS=$(aws cloudfront list-distributions --output json 2>/dev/null | \
-            jq -r '.DistributionList.Items[]? | "\(.Id)|\(.Comment)|\(.Status)|\(.Enabled)"' 2>/dev/null || true)
+            jq -r '.DistributionList.Items[]? | "\(.Id)|\(.Comment)|\(.Status)|\(.Enabled)|\(.WebACLId)"' 2>/dev/null || true)
           
           if [ -z "$DISTRIBUTIONS" ]; then
             echo "✅ No CloudFront distributions found to process"
@@ -144,7 +144,7 @@ jobs:
             echo ""
             
             # Process each distribution with detailed progress
-            echo "$DISTRIBUTIONS" | while IFS='|' read -r dist_id comment status enabled; do
+            echo "$DISTRIBUTIONS" | while IFS='|' read -r dist_id comment status enabled webacl_id; do
               # Use the same logic as your deploy script - look for PROJECT_NAME in comment
               if [[ "$comment" == *"$PROJECT_NAME"* ]]; then
                 echo "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
@@ -152,33 +152,49 @@ jobs:
                 echo "   Comment: $comment"
                 echo "   Status: $status"
                 echo "   Enabled: $enabled"
+                echo "   WAF Attached: $webacl_id"
                 echo ""
                 
-                # PHASE 1: DISABLE if enabled
+                # PHASE 1: DISABLE if enabled (with WAF detachment)
                 if [ "$enabled" = "true" ]; then
-                  echo "   🔄 Phase 1: Disabling distribution..."
+                  echo "   🔄 Phase 1: Disabling distribution and detaching WAF..."
                   START_TIME=$(date +%s)
                   
-                  # Get current config
+                  # Get current config using the improved method
                   echo "      📥 Fetching distribution config..."
                   if aws cloudfront get-distribution-config --id "$dist_id" > /tmp/cf_$dist_id.json 2>/dev/null; then
                     ETAG=$(jq -r '.ETag' /tmp/cf_$dist_id.json)
                     echo "      ✅ Config fetched (ETag: $ETAG)"
                     
-                    # Modify config to disable
-                    echo "      📝 Updating config to disable distribution..."
-                    jq '.DistributionConfig.Enabled = false' /tmp/cf_$dist_id.json > /tmp/cf_disabled_$dist_id.json
+                    # Extract DistributionConfig and apply WAF detachment + disable
+                    echo "      📝 Detaching WAF and disabling distribution..."
+                    jq '.DistributionConfig' /tmp/cf_$dist_id.json > /tmp/cf_config_$dist_id.json
+                    
+                    # Detach WAF and disable
+                    jq '.WebACLId = null | .Enabled = false' /tmp/cf_config_$dist_id.json > /tmp/cf_disabled_$dist_id.json
+                    
+                    # Preserve CallerReference (required)
+                    CALLER_REF=$(jq -r '.CallerReference' /tmp/cf_config_$dist_id.json)
+                    jq --arg ref "$CALLER_REF" '.CallerReference = $ref' /tmp/cf_disabled_$dist_id.json > /tmp/cf_final_$dist_id.json
+                    
+                    echo "      🔧 Configuration updated:"
+                    echo "         - WAF detached: ✅"
+                    echo "         - Distribution disabled: ✅" 
+                    echo "         - CallerReference preserved: ✅"
                     
                     # Update distribution
+                    echo "      🚀 Applying updated configuration..."
                     if aws cloudfront update-distribution \
                       --id "$dist_id" \
                       --if-match "$ETAG" \
-                      --distribution-config "$(jq -c '.DistributionConfig' /tmp/cf_disabled_$dist_id.json)" \
-                      2>/dev/null; then
+                      --distribution-config file:///tmp/cf_final_$dist_id.json 2>/dev/null; then
                       END_TIME=$(date +%s)
                       DURATION=$((END_TIME - START_TIME))
                       echo "      ✅ Disable command accepted (${DURATION}s)"
                       TOTAL_DISABLED=$((TOTAL_DISABLED + 1))
+                      
+                      # Clean up temp files
+                      rm -f /tmp/cf_$dist_id.json /tmp/cf_config_$dist_id.json /tmp/cf_disabled_$dist_id.json /tmp/cf_final_$dist_id.json
                     else
                       END_TIME=$(date +%s)
                       DURATION=$((END_TIME - START_TIME))
@@ -192,7 +208,37 @@ jobs:
                     TOTAL_FAILED=$((TOTAL_FAILED + 1))
                   fi
                 else
-                  echo "   ✅ Already disabled - skipping disable phase"
+                  echo "   ✅ Already disabled - checking WAF attachment..."
+                  
+                  # Even if disabled, we should detach WAF if present
+                  if [ "$webacl_id" != "null" ] && [ -n "$webacl_id" ]; then
+                    echo "   🔄 Detaching WAF from disabled distribution..."
+                    START_TIME=$(date +%s)
+                    
+                    if aws cloudfront get-distribution-config --id "$dist_id" > /tmp/cf_$dist_id.json 2>/dev/null; then
+                      ETAG=$(jq -r '.ETag' /tmp/cf_$dist_id.json)
+                      jq '.DistributionConfig' /tmp/cf_$dist_id.json > /tmp/cf_config_$dist_id.json
+                      jq '.WebACLId = null' /tmp/cf_config_$dist_id.json > /tmp/cf_nowaf_$dist_id.json
+                      CALLER_REF=$(jq -r '.CallerReference' /tmp/cf_config_$dist_id.json)
+                      jq --arg ref "$CALLER_REF" '.CallerReference = $ref' /tmp/cf_nowaf_$dist_id.json > /tmp/cf_final_$dist_id.json
+                      
+                      if aws cloudfront update-distribution \
+                        --id "$dist_id" \
+                        --if-match "$ETAG" \
+                        --distribution-config file:///tmp/cf_final_$dist_id.json 2>/dev/null; then
+                        END_TIME=$(date +%s)
+                        DURATION=$((END_TIME - START_TIME))
+                        echo "      ✅ WAF detached from disabled distribution (${DURATION}s)"
+                      else
+                        echo "      ⚠️  Could not detach WAF from disabled distribution"
+                      fi
+                      
+                      # Clean up temp files
+                      rm -f /tmp/cf_$dist_id.json /tmp/cf_config_$dist_id.json /tmp/cf_nowaf_$dist_id.json /tmp/cf_final_$dist_id.json
+                    fi
+                  else
+                    echo "   ✅ No WAF attached to disabled distribution"
+                  fi
                 fi
                 
                 # PHASE 2: DELETE distribution
@@ -275,8 +321,8 @@ jobs:
           fi
           
           echo ""
-          echo "⏳ Waiting 30 seconds for operations to propagate..."
-          sleep 30
+          echo "⏳ Waiting 60 seconds for operations to propagate..."
+          sleep 60
           echo "✅ Step 1 completed - proceeding to next steps"
 
 
