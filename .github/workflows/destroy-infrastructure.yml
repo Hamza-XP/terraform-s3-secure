@@ -196,7 +196,7 @@ jobs:
                         # 2️⃣ Add trusted signer fix and preserve all required fields
                         echo "      📝 Detaching WAF and disabling distribution with trusted signer fix..."
                         jq '.DistributionConfig
-                            | .WebACLId = null
+                            | .WebACLId = ""
                             | .Enabled = false
                             | .DefaultCacheBehavior.TrustedSigners = (.DefaultCacheBehavior.TrustedSigners // {Enabled:false, Quantity:0})
                             | .DefaultCacheBehavior.TrustedKeyGroups = (.DefaultCacheBehavior.TrustedKeyGroups // {Enabled:false, Quantity:0})
