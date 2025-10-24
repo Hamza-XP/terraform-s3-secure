@@ -68,6 +68,18 @@ jobs:
         id: scan
         run: |
           TF_DIR="${{ steps.detect.outputs.dir }}"
+          echo "📁 Detected Terraform directory: $TF_DIR"
+          if [ ! -f "$TF_DIR/terraform.tfvars" ]; then
+            echo "❌ ERROR: File not found: $TF_DIR/terraform.tfvars"
+            exit 1
+          fi
+          PROJECT_NAME=$(grep -E '^project_name\s*=' "$TF_DIR/terraform.tfvars" | cut -d '"' -f2)
+          if [ -z "$PROJECT_NAME" ]; then
+            echo "❌ ERROR: Could not extract project_name from $TF_DIR/terraform.tfvars"
+            exit 1
+          fi
+          echo "✅ PROJECT_NAME: $PROJECT_NAME"
+          echo "project_name=$PROJECT_NAME" >> $GITHUB_OUTPUT
           PROJECT_NAME=$(grep -E '^project_name\s*=' "terraform/terraform.tfvars" | cut -d '"' -f2)
           PREFIX="${PROJECT_NAME}-${{ github.event.inputs.environment }}"
           
