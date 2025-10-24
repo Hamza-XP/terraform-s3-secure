@@ -105,52 +105,40 @@ jobs:
           
           echo "" >> $GITHUB_STEP_SUMMARY
 
-      - name: "Step 1: Disable and Delete CloudFront Distributions"
+      - name: "Step 1: Disable CloudFront Distributions"
         continue-on-error: true
         run: |
-          PROJECT_NAME="${{ steps.scan.outputs.project_name }}"
           PREFIX="${{ steps.scan.outputs.prefix }}"
-          
           echo "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
-          echo "☁️  STEP 1: Disable CloudFront Distributions"
+          echo "☁️  STEP 1: Disabling CloudFront Distributions"
           echo "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
           echo ""
-          echo "🔍 Using PROJECT_NAME: $PROJECT_NAME"
           
-          # Use direct detection with the exact pattern from your deploy script
-          DISTRIBUTIONS=$(aws cloudfront list-distributions --output json 2>/dev/null | \
-            jq -r '.DistributionList.Items[]? | "\(.Id)|\(.Comment)|\(.Status)|\(.Enabled)"' 2>/dev/null || true)
+          # Fixed: Only check Comment field, removed problematic Aliases check
+          aws cloudfront list-distributions --output json 2>/dev/null | \
+          jq -r ".DistributionList.Items[]? | select(.Comment | contains(\"$PREFIX\")) | \"\(.Id)|\(.Comment)|\(.Enabled)\"" | \
+          while IFS='|' read -r dist_id comment enabled; do
+            echo "📍 Distribution: $dist_id ($comment)"
+            
+            if [ "$enabled" = "true" ]; then
+              echo "   Disabling..."
+              aws cloudfront get-distribution-config --id "$dist_id" > /tmp/cf_$dist_id.json 2>/dev/null
+              ETAG=$(jq -r '.ETag' /tmp/cf_$dist_id.json)
+              jq '.DistributionConfig.Enabled = false' /tmp/cf_$dist_id.json > /tmp/cf_disabled_$dist_id.json
+              
+              aws cloudfront update-distribution \
+                --id "$dist_id" \
+                --if-match "$ETAG" \
+                --distribution-config "$(jq -c '.DistributionConfig' /tmp/cf_disabled_$dist_id.json)" \
+                2>/dev/null && echo "   ✅ Disabled" || echo "   ⚠️  Already disabled"
+            else
+              echo "   ✅ Already disabled"
+            fi
+          done
           
-          if [ -z "$DISTRIBUTIONS" ]; then
-            echo "❌ No CloudFront distributions found"
-          else
-            echo "📍 Processing distributions:"
-            echo "$DISTRIBUTIONS" | while IFS='|' read -r dist_id comment status enabled; do
-              # Use the same logic as your deploy script - look for TARGET_PREFIX in comment
-              if [[ "$comment" == *"$PROJECT_NAME"* ]]; then
-                echo "  🗑️  Targeting: $dist_id ($comment) - Enabled: $enabled, Status: $status"
-                
-                # DISABLE if enabled (same as your deploy script)
-                if [ "$enabled" = "true" ]; then
-                  echo "     Disabling..."
-                  aws cloudfront get-distribution-config --id "$dist_id" > /tmp/cf_$dist_id.json 2>/dev/null
-                  ETAG=$(jq -r '.ETag' /tmp/cf_$dist_id.json)
-                  jq '.DistributionConfig.Enabled = false' /tmp/cf_$dist_id.json > /tmp/cf_disabled_$dist_id.json
-                  aws cloudfront update-distribution \
-                    --id "$dist_id" \
-                    --if-match "$ETAG" \
-                    --distribution-config "$(jq -c '.DistributionConfig' /tmp/cf_disabled_$dist_id.json)" \
-                    2>/dev/null && echo "     ✅ Disabled" || echo "     ⚠️  Failed to disable"
-                fi
-              else
-                echo "  ⏭️  Skipping: $dist_id (comment doesn't match: $comment)"
-              fi
-            done
-            echo ""
-            echo "⏳ Waiting 60 seconds for initial operations to process..."
-            sleep 60
-          fi
-
+          echo ""
+          echo "⏳ Waiting 30 seconds for distributions to start disabling..."
+          sleep 30
 
       - name: "Step 2: Empty and Delete S3 Buckets"
         continue-on-error: true
