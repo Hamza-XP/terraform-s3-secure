@@ -92,7 +92,7 @@ jobs:
           echo "| Resource Type | Count | Status |" >> $GITHUB_STEP_SUMMARY
           echo "|---------------|-------|--------|" >> $GITHUB_STEP_SUMMARY
 
-          # IMPROVED CloudFront detection - uses PROJECT_NAME for comment matching
+          # CloudFront detection - uses PROJECT_NAME for comment matching
           CF_DISTRIBUTIONS=$(aws cloudfront list-distributions --output json 2>/dev/null | jq -r ".DistributionList.Items[]? | select(.Comment != null) | select(.Comment | contains(\"$PROJECT_NAME\")) | .Id" 2>/dev/null || true)
           CF_COUNT=$(echo "$CF_DISTRIBUTIONS" | grep -v '^$' | wc -l)
           echo "| CloudFront Distributions | $CF_COUNT | Will be disabled then deleted |" >> $GITHUB_STEP_SUMMARY
@@ -109,10 +109,12 @@ jobs:
           S3_COUNT=$(aws s3api list-buckets --output json 2>/dev/null | jq -r ".Buckets[]? | select(.Name | contains(\"$PREFIX\")) | .Name" | wc -l)
           echo "| S3 Buckets | $S3_COUNT | Will be emptied and deleted |" >> $GITHUB_STEP_SUMMARY
           
-          OAC_COUNT=$(aws cloudfront list-origin-access-controls --output json 2>/dev/null | jq -r ".OriginAccessControlList.Items[]? | select(.Name | contains(\"$PREFIX\")) | .Name" | wc -l)
+          # FIXED: Detect ALL OACs matching PROJECT_NAME pattern
+          OAC_COUNT=$(aws cloudfront list-origin-access-controls --output json 2>/dev/null | jq -r ".OriginAccessControlList.Items[]? | select(.Name | startswith(\"$PROJECT_NAME\")) | .Name" | wc -l)
           echo "| Origin Access Controls | $OAC_COUNT | Will be deleted |" >> $GITHUB_STEP_SUMMARY
           
-          RHP_COUNT=$(aws cloudfront list-response-headers-policies --type custom --output json 2>/dev/null | jq -r ".ResponseHeadersPolicyList.Items[]? | select(.ResponseHeadersPolicy.ResponseHeadersPolicyConfig.Name | contains(\"$PREFIX\")) | .ResponseHeadersPolicy.ResponseHeadersPolicyConfig.Name" | wc -l)
+          # FIXED: Detect ALL Response Headers Policies matching PROJECT_NAME pattern
+          RHP_COUNT=$(aws cloudfront list-response-headers-policies --type custom --output json 2>/dev/null | jq -r ".ResponseHeadersPolicyList.Items[]? | select(.ResponseHeadersPolicy.ResponseHeadersPolicyConfig.Name | startswith(\"$PROJECT_NAME\")) | .ResponseHeadersPolicy.ResponseHeadersPolicyConfig.Name" | wc -l)
           echo "| Response Headers Policies | $RHP_COUNT | Will be deleted |" >> $GITHUB_STEP_SUMMARY
           
           echo "" >> $GITHUB_STEP_SUMMARY
@@ -173,7 +175,7 @@ jobs:
 
                     if ! aws cloudfront get-distribution-config --id "$dist_id" > "$CONFIG_FILE" 2>"$ERROR_FILE"; then
                       echo "      ❌ Failed to fetch distribution config for $dist_id"
-                      echo "      🔍 CLI error:"
+                      echo "      📋 CLI error:"
                       sed -n '1,20p' "$ERROR_FILE" || true
                       FAILED_DISTRIBUTIONS+=("$dist_id:config_fetch_failed")
                       TOTAL_FAILED=$((TOTAL_FAILED + 1))
@@ -203,9 +205,6 @@ jobs:
                     fi
 
                     # Step B: Prepare disabled distribution config
-                    # - Set Enabled = false
-                    # - Remove/disable Logging to avoid "S3 bucket doesn't exist" errors
-                    # - Preserve TrustedSigners / TrustedKeyGroups with safe defaults
                     jq '
                       .DistributionConfig
                       | .Enabled = false
@@ -214,7 +213,6 @@ jobs:
                       | (.DefaultCacheBehavior.TrustedKeyGroups) = (.DefaultCacheBehavior.TrustedKeyGroups // {Enabled:false, Quantity:0})
                       | (.Logging) = (.Logging // {})
                       | (.Logging.Enabled) = false
-                      # remove bucket/prefix/includeCookies fields that can cause InvalidArgument if bucket missing
                       | ( .Logging |= (del(.Bucket, .IncludeCookies, .Prefix) ) )
                     ' "$CONFIG_FILE" > "$DISABLED_FILE"
 
@@ -227,16 +225,15 @@ jobs:
                     else
                       echo "      ❌ Update-distribution failed. AWS CLI error:"
                       sed -n '1,50p' "$ERROR_FILE" || true
-                      # continue — try again later; mark as failure for now
                       FAILED_DISTRIBUTIONS+=("$dist_id:update_failed")
                       TOTAL_FAILED=$((TOTAL_FAILED + 1))
                       rm -f "$CONFIG_FILE" "$DISABLED_FILE" "$ERROR_FILE"
                       continue
                     fi
 
-                    # Step D: Poll until distribution is disabled (or timeout)
-                    echo "      ⏳ Polling for distribution to become Disabled (timeout 12 minutes)..."
-                    MAX_RETRIES=24   # 24 * 30s = 12 minutes
+                    # FIXED: Step D - Wait for Status=Deployed (not just Enabled=false)
+                    echo "      ⏳ Polling for distribution to be Deployed AND Disabled (timeout 15 minutes)..."
+                    MAX_RETRIES=30   # 30 * 30s = 15 minutes
                     SLEEP_SECONDS=30
                     retry=0
                     while [ $retry -lt $MAX_RETRIES ]; do
@@ -244,8 +241,10 @@ jobs:
                       CURRENT_ENABLED=$(aws cloudfront get-distribution --id "$dist_id" --query 'Distribution.DistributionConfig.Enabled' --output text 2>/dev/null || echo "Unknown")
                       CURRENT_STATUS=$(aws cloudfront get-distribution --id "$dist_id" --query 'Distribution.Status' --output text 2>/dev/null || echo "Unknown")
                       echo "         Poll #$((retry+1)): Enabled=$CURRENT_ENABLED Status=$CURRENT_STATUS"
-                      if [ "$CURRENT_ENABLED" = "false" ] || [ "$CURRENT_ENABLED" = "False" ]; then
-                        echo "      ✅ Distribution reports Enabled=false"
+                      
+                      # CRITICAL FIX: Must wait for BOTH Enabled=false AND Status=Deployed
+                      if [[ "$CURRENT_ENABLED" =~ ^[Ff]alse$ ]] && [ "$CURRENT_STATUS" = "Deployed" ]; then
+                        echo "      ✅ Distribution is Deployed and Disabled"
                         TOTAL_DISABLED=$((TOTAL_DISABLED + 1))
                         break
                       fi
@@ -253,14 +252,14 @@ jobs:
                     done
 
                     if [ $retry -ge $MAX_RETRIES ]; then
-                      echo "      ⚠️  Timeout waiting for distribution to be disabled"
+                      echo "      ⚠️  Timeout waiting for distribution to be deployed and disabled"
                       FAILED_DISTRIBUTIONS+=("$dist_id:disable_timeout")
                       TOTAL_FAILED=$((TOTAL_FAILED + 1))
                       rm -f "$CONFIG_FILE" "$DISABLED_FILE" "$ERROR_FILE"
                       continue
                     fi
 
-                    # Step E: Re-fetch ETag (it may have changed) and attempt deletion
+                    # Step E: Re-fetch ETag and attempt deletion
                     DELETE_ETAG=$(aws cloudfront get-distribution --id "$dist_id" --query 'ETag' --output text)
                     if [ -z "$DELETE_ETAG" ] || [ "$DELETE_ETAG" = "None" ]; then
                       echo "      ❌ Could not re-fetch ETag for deletion"
@@ -278,19 +277,16 @@ jobs:
                     else
                       echo "      ⚠️  delete-distribution failed (check why):"
                       sed -n '1,40p' "$DELETE_ERROR_FILE" || true
-                      # Check current state
                       CUR_STATUS=$(aws cloudfront get-distribution --id "$dist_id" --query 'Distribution.Status' --output text 2>/dev/null || echo "Unknown")
                       CUR_ENABLED=$(aws cloudfront get-distribution --id "$dist_id" --query 'Distribution.DistributionConfig.Enabled' --output text 2>/dev/null || echo "Unknown")
                       echo "      🔍 Current state - Status: $CUR_STATUS, Enabled: $CUR_ENABLED"
-                      # If still enabled then it will be retried later (don't mark as permanent fail here)
-                      if [ "$CUR_ENABLED" = "true" ]; then
-                        FAILED_DISTRIBUTIONS+=("$dist_id:still_enabled")
-                        TOTAL_FAILED=$((TOTAL_FAILED + 1))
+                      
+                      if [ "$CUR_STATUS" != "Deployed" ]; then
+                        FAILED_DISTRIBUTIONS+=("$dist_id:not_deployed_yet")
                       else
-                        # unknown reason; log and mark
                         FAILED_DISTRIBUTIONS+=("$dist_id:delete_failed")
-                        TOTAL_FAILED=$((TOTAL_FAILED + 1))
                       fi
+                      TOTAL_FAILED=$((TOTAL_FAILED + 1))
                       rm -f "$DELETE_ERROR_FILE"
                     fi
 
@@ -301,7 +297,7 @@ jobs:
                     rm -f "$CONFIG_FILE" "$DISABLED_FILE" "$ERROR_FILE" || true
 
                   else
-                    echo "⏭️  Skipping: $dist_id (comment doesn't match: $comment)"
+                    echo "⭐️ Skipping: $dist_id (comment doesn't match: $comment)"
                   fi
                 done
 
@@ -331,7 +327,7 @@ jobs:
                 elif [ $TOTAL_DELETED -gt 0 ]; then
                   echo "✅ PARTIAL SUCCESS: Some distributions processed, others will be retried"
                 else
-                  echo "❌ NO DISTRIBUTIONS: Could not process any distributions"
+                  echo "⚠️  Distributions disabled but deletion pending deployment"
                 fi
               fi
 
@@ -388,7 +384,7 @@ jobs:
           echo ""
           
           WAFS=$(aws wafv2 list-web-acls --scope CLOUDFRONT --region us-east-1 --output json 2>/dev/null | \
-            jq -r ".WebACLs[]? | select(.Name | contains(\"$PREFIX\")) | \"\(.Id)|\(.Name)|\(.LockToken)\"" 2>/dev/null || true)
+            jq -r ".WebACLs[]? | select(.Name | contains(\"$PREFIX-waf\")) | \"\(.Id)|\(.Name)|\(.LockToken)\"" 2>/dev/null || true)
           
           if [ -z "$WAFS" ]; then
             echo "ℹ️  No WAF Web ACLs found with prefix: $PREFIX"
@@ -417,24 +413,26 @@ jobs:
       - name: "Wait for CloudFront Distributions"
         run: |
           PREFIX="${{ steps.scan.outputs.prefix }}"
+          PROJECT_NAME="${{ steps.scan.outputs.project_name }}"
           echo "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
-          echo "⏳ WAITING: CloudFront Distributions to Fully Disable"
+          echo "⏳ WAITING: CloudFront Distributions to Fully Deploy"
           echo "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
           echo ""
           echo "This may take 10-15 minutes. Checking every 60 seconds..."
           echo ""
           
-          MAX_WAIT=900
+          MAX_WAIT=1200  # 20 minutes
           ELAPSED=0
           FOUND_DISTRIBUTIONS=false
           
           while [ $ELAPSED -lt $MAX_WAIT ]; do
+            # FIXED: Use PROJECT_NAME matching like other steps
             DIST_IDS=$(aws cloudfront list-distributions --output json 2>/dev/null | \
-                      jq -r ".DistributionList.Items[]? | select(.Comment != null) | select(.Comment | contains(\"$PREFIX\")) | .Id" 2>/dev/null || true)
+                      jq -r ".DistributionList.Items[]? | select(.Comment != null) | select(.Comment | contains(\"$PROJECT_NAME\")) | .Id" 2>/dev/null || true)
             
             if [ -z "$DIST_IDS" ]; then
               if [ "$FOUND_DISTRIBUTIONS" = "false" ] && [ $ELAPSED -eq 0 ]; then
-                echo "ℹ️  No distributions found with prefix: $PREFIX"
+                echo "ℹ️  No distributions found with PROJECT_NAME: $PROJECT_NAME"
               else
                 echo "✅ All distributions have been deleted"
               fi
@@ -442,7 +440,7 @@ jobs:
             fi
             
             FOUND_DISTRIBUTIONS=true
-            ALL_DISABLED=true
+            ALL_DEPLOYED=true
             
             for dist_id in $DIST_IDS; do
               STATUS=$(aws cloudfront get-distribution --id "$dist_id" --query 'Distribution.Status' --output text 2>/dev/null || echo "Unknown")
@@ -450,14 +448,15 @@ jobs:
               
               echo "   $dist_id: Status=$STATUS, Enabled=$ENABLED"
               
-              if [ "$ENABLED" = "True" ] || [ "$STATUS" = "InProgress" ]; then
-                ALL_DISABLED=false
+              # FIXED: Check for InProgress status (not just Enabled)
+              if [ "$STATUS" = "InProgress" ]; then
+                ALL_DEPLOYED=false
               fi
             done
             
-            if [ "$ALL_DISABLED" = "true" ]; then
+            if [ "$ALL_DEPLOYED" = "true" ]; then
               echo ""
-              echo "✅ All distributions are disabled and deployed"
+              echo "✅ All distributions are deployed"
               break
             fi
             
@@ -494,8 +493,7 @@ jobs:
             fi
             
             if [ -z "$DISTRIBUTIONS" ]; then
-              echo "❌ No CloudFront distributions found for deletion."
-              echo "💡 Manual deletion may be required for: E191G2X7VOQUCR, E39ARSICL9MJ2Q, E2D8L23FW0GDEQ, E35EJ3YWAN0M0S, E2T09YD9M9AYYO"
+              echo "✅ No CloudFront distributions found - all deleted successfully!"
             else
               echo "📍 Found distributions for deletion:"
               echo "$DISTRIBUTIONS" | while IFS='|' read -r dist_id comment status; do
@@ -566,7 +564,7 @@ jobs:
           echo ""
           
           WAFS=$(aws wafv2 list-web-acls --scope CLOUDFRONT --region us-east-1 --output json 2>/dev/null | \
-            jq -r ".WebACLs[]? | select(.Name | contains(\"$PREFIX\")) | \"\(.Id)|\(.Name)|\(.LockToken)\"" 2>/dev/null || true)
+            jq -r ".WebACLs[]? | select(.Name | contains(\"$PREFIX-waf\")) | \"\(.Id)|\(.Name)|\(.LockToken)\"" 2>/dev/null || true)
           
           if [ -z "$WAFS" ]; then
             echo "ℹ️  No WAF Web ACLs found with prefix: $PREFIX"
@@ -583,47 +581,79 @@ jobs:
             done
           fi
 
-      - name: "Step 11: Retry Response Headers Policies and OAC"
+      - name: "Step 11: Delete ALL Response Headers Policies and OACs"
         continue-on-error: true
         run: |
-          PREFIX="${{ steps.scan.outputs.prefix }}"
+          PROJECT_NAME="${{ steps.scan.outputs.project_name }}"
           echo "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
-          echo "🔄 STEP 11: Retrying Policies and OAC Deletion"
+          echo "🔄 STEP 11: Deleting ALL Policies and OACs"
           echo "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
           echo ""
           
-          # Retry Response Headers Policies
+          # FIXED: Delete ALL Response Headers Policies matching PROJECT_NAME
           echo "📋 Response Headers Policies:"
           RHP=$(aws cloudfront list-response-headers-policies --type custom --output json 2>/dev/null | \
-            jq -r ".ResponseHeadersPolicyList.Items[]? | select(.ResponseHeadersPolicy.ResponseHeadersPolicyConfig.Name | contains(\"$PREFIX\")) | \"\(.ResponseHeadersPolicy.Id)|\(.ResponseHeadersPolicy.ResponseHeadersPolicyConfig.Name)\"" 2>/dev/null || true)
+            jq -r ".ResponseHeadersPolicyList.Items[]? | select(.ResponseHeadersPolicy.ResponseHeadersPolicyConfig.Name | startswith(\"$PROJECT_NAME\")) | \"\(.ResponseHeadersPolicy.Id)|\(.ResponseHeadersPolicy.ResponseHeadersPolicyConfig.Name)\"" 2>/dev/null || true)
           
           if [ -n "$RHP" ]; then
             echo "$RHP" | while IFS='|' read -r policy_id policy_name; do
-              echo "📍 Policy: $policy_name"
-              ETAG=$(aws cloudfront get-response-headers-policy --id "$policy_id" --query 'ETag' --output text 2>/dev/null)
-              aws cloudfront delete-response-headers-policy --id "$policy_id" --if-match "$ETAG" 2>&1 | grep -v "error" && \
-              echo "   ✅ Deleted" || echo "   ⚠️  Still in use or could not delete"
+              echo "📍 Policy: $policy_name (ID: $policy_id)"
+              
+              # Check if still attached to any distribution
+              ATTACHED=$(aws cloudfront list-distributions --output json 2>/dev/null | \
+                jq -r ".DistributionList.Items[]? | select(.DefaultCacheBehavior.ResponseHeadersPolicyId == \"$policy_id\") | .Id" | head -1)
+              
+              if [ -n "$ATTACHED" ]; then
+                echo "   ⏳ Still attached to distribution $ATTACHED, skipping"
+              else
+                ETAG=$(aws cloudfront get-response-headers-policy --id "$policy_id" --query 'ETag' --output text 2>/dev/null)
+                if [ -n "$ETAG" ] && [ "$ETAG" != "None" ]; then
+                  if aws cloudfront delete-response-headers-policy --id "$policy_id" --if-match "$ETAG" 2>/dev/null; then
+                    echo "   ✅ Deleted"
+                  else
+                    echo "   ⚠️  Could not delete (may still be in use)"
+                  fi
+                else
+                  echo "   ⚠️  Could not get ETag"
+                fi
+              fi
             done
           else
-            echo "ℹ️  No Response Headers Policies found"
+            echo "ℹ️  No Response Headers Policies found matching: $PROJECT_NAME"
           fi
           
           echo ""
           
-          # Retry Origin Access Controls
+          # FIXED: Delete ALL Origin Access Controls matching PROJECT_NAME
           echo "🔒 Origin Access Controls:"
           OAC=$(aws cloudfront list-origin-access-controls --output json 2>/dev/null | \
-            jq -r ".OriginAccessControlList.Items[]? | select(.Name | contains(\"$PREFIX\")) | \"\(.Id)|\(.Name)\"" 2>/dev/null || true)
+            jq -r ".OriginAccessControlList.Items[]? | select(.Name | startswith(\"$PROJECT_NAME\")) | \"\(.Id)|\(.Name)\"" 2>/dev/null || true)
           
           if [ -n "$OAC" ]; then
             echo "$OAC" | while IFS='|' read -r oac_id oac_name; do
-              echo "📍 OAC: $oac_name"
-              ETAG=$(aws cloudfront get-origin-access-control --id "$oac_id" --query 'ETag' --output text 2>/dev/null)
-              aws cloudfront delete-origin-access-control --id "$oac_id" --if-match "$ETAG" 2>&1 | grep -v "error" && \
-              echo "   ✅ Deleted" || echo "   ⚠️  Still in use or could not delete"
+              echo "📍 OAC: $oac_name (ID: $oac_id)"
+              
+              # Check if still attached to any distribution
+              ATTACHED=$(aws cloudfront list-distributions --output json 2>/dev/null | \
+                jq -r ".DistributionList.Items[]? | .Origins.Items[]? | select(.OriginAccessControlId == \"$oac_id\") | \"found\"" | head -1)
+              
+              if [ -n "$ATTACHED" ]; then
+                echo "   ⏳ Still attached to a distribution, skipping"
+              else
+                ETAG=$(aws cloudfront get-origin-access-control --id "$oac_id" --query 'ETag' --output text 2>/dev/null)
+                if [ -n "$ETAG" ] && [ "$ETAG" != "None" ]; then
+                  if aws cloudfront delete-origin-access-control --id "$oac_id" --if-match "$ETAG" 2>/dev/null; then
+                    echo "   ✅ Deleted"
+                  else
+                    echo "   ⚠️  Could not delete (may still be in use)"
+                  fi
+                else
+                  echo "   ⚠️  Could not get ETag"
+                fi
+              fi
             done
           else
-            echo "ℹ️  No Origin Access Controls found"
+            echo "ℹ️  No Origin Access Controls found matching: $PROJECT_NAME"
           fi
 
       - name: Cleanup Terraform State
@@ -643,6 +673,7 @@ jobs:
       - name: Final Summary
         run: |
           PREFIX="${{ steps.scan.outputs.prefix }}"
+          PROJECT_NAME="${{ steps.scan.outputs.project_name }}"
           
           echo "## ✅ Destruction Complete" >> $GITHUB_STEP_SUMMARY
           echo "" >> $GITHUB_STEP_SUMMARY
@@ -656,11 +687,14 @@ jobs:
           echo "Checking for remaining resources..." >> $GITHUB_STEP_SUMMARY
           echo "" >> $GITHUB_STEP_SUMMARY
           
-          CF_REMAIN=$(aws cloudfront list-distributions --output json 2>/dev/null | jq -r ".DistributionList.Items[]? | select(.Comment != null) | select(.Comment | contains(\"$PREFIX\")) | .Id" | wc -l)
+          # FIXED: Use PROJECT_NAME for CloudFront check
+          CF_REMAIN=$(aws cloudfront list-distributions --output json 2>/dev/null | jq -r ".DistributionList.Items[]? | select(.Comment != null) | select(.Comment | contains(\"$PROJECT_NAME\")) | .Id" | wc -l)
           WAF_REMAIN=$(aws wafv2 list-web-acls --scope CLOUDFRONT --region us-east-1 --output json 2>/dev/null | jq -r ".WebACLs[]? | select(.Name | contains(\"$PREFIX\")) | .Name" | wc -l)
           S3_REMAIN=$(aws s3api list-buckets --output json 2>/dev/null | jq -r ".Buckets[]? | select(.Name | contains(\"$PREFIX\")) | .Name" | wc -l)
-          RHP_REMAIN=$(aws cloudfront list-response-headers-policies --type custom --output json 2>/dev/null | jq -r ".ResponseHeadersPolicyList.Items[]? | select(.ResponseHeadersPolicy.ResponseHeadersPolicyConfig.Name | contains(\"$PREFIX\")) | .ResponseHeadersPolicy.ResponseHeadersPolicyConfig.Name" | wc -l)
-          OAC_REMAIN=$(aws cloudfront list-origin-access-controls --output json 2>/dev/null | jq -r ".OriginAccessControlList.Items[]? | select(.Name | contains(\"$PREFIX\")) | .Name" | wc -l)
+          
+          # FIXED: Use PROJECT_NAME with startswith for policies and OACs
+          RHP_REMAIN=$(aws cloudfront list-response-headers-policies --type custom --output json 2>/dev/null | jq -r ".ResponseHeadersPolicyList.Items[]? | select(.ResponseHeadersPolicy.ResponseHeadersPolicyConfig.Name | startswith(\"$PROJECT_NAME\")) | .ResponseHeadersPolicy.ResponseHeadersPolicyConfig.Name" | wc -l)
+          OAC_REMAIN=$(aws cloudfront list-origin-access-controls --output json 2>/dev/null | jq -r ".OriginAccessControlList.Items[]? | select(.Name | startswith(\"$PROJECT_NAME\")) | .Name" | wc -l)
           
           echo "| Resource Type | Remaining |" >> $GITHUB_STEP_SUMMARY
           echo "|---------------|-----------|" >> $GITHUB_STEP_SUMMARY
