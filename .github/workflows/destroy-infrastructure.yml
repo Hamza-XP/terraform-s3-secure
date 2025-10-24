@@ -80,7 +80,6 @@ jobs:
           fi
           echo "✅ PROJECT_NAME: $PROJECT_NAME"
           echo "project_name=$PROJECT_NAME" >> $GITHUB_OUTPUT
-          PROJECT_NAME=$(grep -E '^project_name\s*=' "terraform/terraform.tfvars" | cut -d '"' -f2)
           PREFIX="${PROJECT_NAME}-${{ github.event.inputs.environment }}"
           
           echo "prefix=$PREFIX" >> $GITHUB_OUTPUT
@@ -121,222 +120,231 @@ jobs:
       - name: "Step 1: Disable and Delete CloudFront Distributions"
         continue-on-error: true
         run: |
-          PROJECT_NAME="${{ steps.scan.outputs.project_name }}"
-          PREFIX="${{ steps.scan.outputs.prefix }}"
-          
-          echo "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
-          echo "☁️  STEP 1: Disable and Delete CloudFront Distributions"
-          echo "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
-          echo ""
-          echo "🔍 Using PROJECT_NAME: $PROJECT_NAME"
-          echo "🔍 Using PREFIX: $PREFIX"
-          echo ""
-          
-          # Initialize counters
-          TOTAL_FOUND=0
-          TOTAL_DISABLED=0
-          TOTAL_DELETED=0
-          TOTAL_FAILED=0
-          FAILED_DISTRIBUTIONS=()
-          
-          echo "📊 Starting CloudFront cleanup process..."
-          echo "⏰ Start time: $(date)"
-          echo ""
-          
-          # Use direct detection with the exact pattern from your deploy script
-          echo "🔍 Scanning for CloudFront distributions..."
-          DISTRIBUTIONS=$(aws cloudfront list-distributions --output json 2>/dev/null | \
-            jq -r '.DistributionList.Items[]? | "\(.Id)|\(.Comment)|\(.Status)|\(.Enabled)|\(.WebACLId)"' 2>/dev/null || true)
-          
-          if [ -z "$DISTRIBUTIONS" ]; then
-            echo "✅ No CloudFront distributions found to process"
-          else
-            TOTAL_FOUND=$(echo "$DISTRIBUTIONS" | wc -l)
-            echo "📍 Found $TOTAL_FOUND distributions to process:"
-            echo ""
-            
-            # Process each distribution with detailed progress
-            echo "$DISTRIBUTIONS" | while IFS='|' read -r dist_id comment status enabled webacl_id; do
-              # Use the same logic as your deploy script - look for PROJECT_NAME in comment
-              if [[ "$comment" == *"$PROJECT_NAME"* ]]; then
-                echo "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
-                echo "🔄 Processing: $dist_id"
-                echo "   Comment: $comment"
-                echo "   Status: $status"
-                echo "   Enabled: $enabled"
-                echo "   WAF Attached: $webacl_id"
+              PROJECT_NAME="${{ steps.scan.outputs.project_name }}"
+              PREFIX="${{ steps.scan.outputs.prefix }}"
+              
+              echo "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
+              echo "☁️  STEP 1: Disable and Delete CloudFront Distributions"
+              echo "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
+              echo ""
+              echo "🔍 Using PROJECT_NAME: $PROJECT_NAME"
+              echo "🔍 Using PREFIX: $PREFIX"
+              echo ""
+              
+              # Get Account ID for WAF disassociation
+              ACCOUNT_ID=$(aws sts get-caller-identity --query "Account" --output text)
+              echo "🔐 AWS Account ID: $ACCOUNT_ID"
+              echo ""
+              
+              # Initialize counters
+              TOTAL_FOUND=0
+              TOTAL_DISABLED=0
+              TOTAL_DELETED=0
+              TOTAL_FAILED=0
+              FAILED_DISTRIBUTIONS=()
+              
+              echo "📊 Starting CloudFront cleanup process..."
+              echo "⏰ Start time: $(date)"
+              echo ""
+              
+              # Use direct detection with the exact pattern from your deploy script
+              echo "🔍 Scanning for CloudFront distributions..."
+              DISTRIBUTIONS=$(aws cloudfront list-distributions --output json | \
+                jq -r '.DistributionList.Items[]? | "\(.Id)|\(.Comment)|\(.Status)|\(.Enabled)|\(.WebACLId)"' || true)
+              
+              if [ -z "$DISTRIBUTIONS" ]; then
+                echo "✅ No CloudFront distributions found to process"
+              else
+                TOTAL_FOUND=$(echo "$DISTRIBUTIONS" | wc -l)
+                echo "📍 Found $TOTAL_FOUND distributions to process:"
                 echo ""
                 
-                # PHASE 1: DISABLE if enabled (with WAF detachment)
-                if [ "$enabled" = "true" ]; then
-                  echo "   🔄 Phase 1: Disabling distribution and detaching WAF..."
-                  START_TIME=$(date +%s)
-                  
-                  # Get current config using the improved method
-                  echo "      📥 Fetching distribution config..."
-                  if aws cloudfront get-distribution-config --id "$dist_id" > /tmp/cf_$dist_id.json 2>/dev/null; then
-                    ETAG=$(jq -r '.ETag' /tmp/cf_$dist_id.json)
-                    echo "      ✅ Config fetched (ETag: $ETAG)"
+                # Process each distribution with detailed progress
+                echo "$DISTRIBUTIONS" | while IFS='|' read -r dist_id comment status enabled webacl_id; do
+                  # Use the same logic as your deploy script - look for PROJECT_NAME in comment
+                  if [[ "$comment" == *"$PROJECT_NAME"* ]]; then
+                    echo "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
+                    echo "🔄 Processing: $dist_id"
+                    echo "   Comment: $comment"
+                    echo "   Status: $status"
+                    echo "   Enabled: $enabled"
+                    echo "   WAF Attached: $webacl_id"
+                    echo ""
                     
-                    # Extract DistributionConfig and apply WAF detachment + disable
-                    echo "      📝 Detaching WAF and disabling distribution..."
-                    jq '.DistributionConfig' /tmp/cf_$dist_id.json > /tmp/cf_config_$dist_id.json
-                    
-                    # Detach WAF and disable
-                    jq '.WebACLId = null | .Enabled = false' /tmp/cf_config_$dist_id.json > /tmp/cf_disabled_$dist_id.json
-                    
-                    # Preserve CallerReference (required)
-                    CALLER_REF=$(jq -r '.CallerReference' /tmp/cf_config_$dist_id.json)
-                    jq --arg ref "$CALLER_REF" '.CallerReference = $ref' /tmp/cf_disabled_$dist_id.json > /tmp/cf_final_$dist_id.json
-                    
-                    echo "      🔧 Configuration updated:"
-                    echo "         - WAF detached: ✅"
-                    echo "         - Distribution disabled: ✅" 
-                    echo "         - CallerReference preserved: ✅"
-                    
-                    # Update distribution
-                    echo "      🚀 Applying updated configuration..."
-                    if aws cloudfront update-distribution \
-                      --id "$dist_id" \
-                      --if-match "$ETAG" \
-                      --distribution-config file:///tmp/cf_final_$dist_id.json 2>/dev/null; then
-                      END_TIME=$(date +%s)
-                      DURATION=$((END_TIME - START_TIME))
-                      echo "      ✅ Disable command accepted (${DURATION}s)"
-                      TOTAL_DISABLED=$((TOTAL_DISABLED + 1))
+                    # PHASE 1: DISABLE if enabled (with WAF detachment)
+                    if [ "$enabled" = "true" ]; then
+                      echo "   🔄 Phase 1: Disabling distribution and detaching WAF..."
+                      START_TIME=$(date +%s)
                       
-                      # Clean up temp files
-                      rm -f /tmp/cf_$dist_id.json /tmp/cf_config_$dist_id.json /tmp/cf_disabled_$dist_id.json /tmp/cf_final_$dist_id.json
+                      # Get current config using the improved method
+                      echo "      📥 Fetching distribution config..."
+                      CONFIG_FILE="/tmp/cf_$dist_id.json"
+                      DISABLED_FILE="/tmp/cf_disabled_$dist_id.json"
+                      
+                      # 1️⃣ Remove silent error suppression
+                      if aws cloudfront get-distribution-config --id "$dist_id" > "$CONFIG_FILE"; then
+                        ETAG=$(jq -r '.ETag' "$CONFIG_FILE")
+                        echo "      ✅ Config fetched (ETag: $ETAG)"
+                        
+                        # 4️⃣ Disassociate WAF cleanly before updating
+                        if [ "$webacl_id" != "null" ] && [ -n "$webacl_id" ]; then
+                          echo "      🛡️  Disassociating WAF..."
+                          aws cloudfront disassociate-web-acl --resource-arn "arn:aws:cloudfront::${ACCOUNT_ID}:distribution/$dist_id" || true
+                          echo "      ✅ WAF disassociation attempted"
+                        fi
+                        
+                        # 2️⃣ Add trusted signer fix and preserve all required fields
+                        echo "      📝 Detaching WAF and disabling distribution with trusted signer fix..."
+                        jq '.DistributionConfig
+                            | .WebACLId = null
+                            | .Enabled = false
+                            | .DefaultCacheBehavior.TrustedSigners = (.DefaultCacheBehavior.TrustedSigners // {Enabled:false, Quantity:0})
+                            | .DefaultCacheBehavior.TrustedKeyGroups = (.DefaultCacheBehavior.TrustedKeyGroups // {Enabled:false, Quantity:0})
+                        ' "$CONFIG_FILE" > "$DISABLED_FILE"
+                        
+                        echo "      🔧 Configuration updated with trusted signer preservation"
+                        
+                        # 3️⃣ Capture and print the AWS error
+                        echo "      🚀 Applying updated configuration..."
+                        ERROR_FILE="/tmp/aws_error_$dist_id.log"
+                        
+                        aws cloudfront update-distribution \
+                          --id "$dist_id" \
+                          --if-match "$ETAG" \
+                          --distribution-config file://"$DISABLED_FILE" \
+                          2>&1 | tee "$ERROR_FILE"
+                        
+                        echo "      🔍 AWS CLI error (if any):"
+                        cat "$ERROR_FILE"
+                        
+                        if [ ${PIPESTATUS[0]} -eq 0 ]; then
+                          END_TIME=$(date +%s)
+                          DURATION=$((END_TIME - START_TIME))
+                          echo "      ✅ Disable command accepted (${DURATION}s)"
+                          TOTAL_DISABLED=$((TOTAL_DISABLED + 1))
+                        else
+                          END_TIME=$(date +%s)
+                          DURATION=$((END_TIME - START_TIME))
+                          echo "      ❌ Disable command failed (${DURATION}s)"
+                          FAILED_DISTRIBUTIONS+=("$dist_id:disable_failed - $(head -1 "$ERROR_FILE")")
+                          TOTAL_FAILED=$((TOTAL_FAILED + 1))
+                        fi
+                        
+                        # Clean up temp files
+                        rm -f "$CONFIG_FILE" "$DISABLED_FILE" "$ERROR_FILE"
+                      else
+                        echo "      ❌ Failed to fetch distribution config"
+                        FAILED_DISTRIBUTIONS+=("$dist_id:config_fetch_failed")
+                        TOTAL_FAILED=$((TOTAL_FAILED + 1))
+                      fi
                     else
-                      END_TIME=$(date +%s)
-                      DURATION=$((END_TIME - START_TIME))
-                      echo "      ❌ Disable command failed (${DURATION}s)"
-                      FAILED_DISTRIBUTIONS+=("$dist_id:disable_failed")
-                      TOTAL_FAILED=$((TOTAL_FAILED + 1))
-                    fi
-                  else
-                    echo "      ❌ Failed to fetch distribution config"
-                    FAILED_DISTRIBUTIONS+=("$dist_id:config_fetch_failed")
-                    TOTAL_FAILED=$((TOTAL_FAILED + 1))
-                  fi
-                else
-                  echo "   ✅ Already disabled - checking WAF attachment..."
-                  
-                  # Even if disabled, we should detach WAF if present
-                  if [ "$webacl_id" != "null" ] && [ -n "$webacl_id" ]; then
-                    echo "   🔄 Detaching WAF from disabled distribution..."
-                    START_TIME=$(date +%s)
-                    
-                    if aws cloudfront get-distribution-config --id "$dist_id" > /tmp/cf_$dist_id.json 2>/dev/null; then
-                      ETAG=$(jq -r '.ETag' /tmp/cf_$dist_id.json)
-                      jq '.DistributionConfig' /tmp/cf_$dist_id.json > /tmp/cf_config_$dist_id.json
-                      jq '.WebACLId = null' /tmp/cf_config_$dist_id.json > /tmp/cf_nowaf_$dist_id.json
-                      CALLER_REF=$(jq -r '.CallerReference' /tmp/cf_config_$dist_id.json)
-                      jq --arg ref "$CALLER_REF" '.CallerReference = $ref' /tmp/cf_nowaf_$dist_id.json > /tmp/cf_final_$dist_id.json
+                      echo "   ✅ Already disabled - checking WAF attachment..."
                       
-                      if aws cloudfront update-distribution \
-                        --id "$dist_id" \
-                        --if-match "$ETAG" \
-                        --distribution-config file:///tmp/cf_final_$dist_id.json 2>/dev/null; then
+                      # Even if disabled, we should detach WAF if present
+                      if [ "$webacl_id" != "null" ] && [ -n "$webacl_id" ]; then
+                        echo "   🔄 Detaching WAF from disabled distribution..."
+                        START_TIME=$(date +%s)
+                        
+                        # Disassociate WAF cleanly
+                        echo "      🛡️  Disassociating WAF from disabled distribution..."
+                        aws cloudfront disassociate-web-acl --resource-arn "arn:aws:cloudfront::${ACCOUNT_ID}:distribution/$dist_id" || true
+                        
                         END_TIME=$(date +%s)
                         DURATION=$((END_TIME - START_TIME))
-                        echo "      ✅ WAF detached from disabled distribution (${DURATION}s)"
+                        echo "      ✅ WAF disassociation attempted (${DURATION}s)"
                       else
-                        echo "      ⚠️  Could not detach WAF from disabled distribution"
+                        echo "   ✅ No WAF attached to disabled distribution"
                       fi
-                      
-                      # Clean up temp files
-                      rm -f /tmp/cf_$dist_id.json /tmp/cf_config_$dist_id.json /tmp/cf_nowaf_$dist_id.json /tmp/cf_final_$dist_id.json
                     fi
-                  else
-                    echo "   ✅ No WAF attached to disabled distribution"
-                  fi
-                fi
-                
-                # PHASE 2: DELETE distribution
-                echo ""
-                echo "   🗑️  Phase 2: Deleting distribution..."
-                START_TIME=$(date +%s)
-                
-                echo "      📥 Getting current ETag for deletion..."
-                ETAG=$(aws cloudfront get-distribution --id "$dist_id" --query 'ETag' --output text 2>/dev/null)
-                
-                if [ -n "$ETAG" ]; then
-                  echo "      ✅ ETag obtained: $ETAG"
-                  echo "      🚀 Initiating deletion..."
-                  
-                  if aws cloudfront delete-distribution --id "$dist_id" --if-match "$ETAG" 2>/dev/null; then
-                    END_TIME=$(date +%s)
-                    DURATION=$((END_TIME - START_TIME))
-                    echo "      ✅ Deletion initiated successfully (${DURATION}s)"
-                    TOTAL_DELETED=$((TOTAL_DELETED + 1))
-                  else
-                    END_TIME=$(date +%s)
-                    DURATION=$((END_TIME - START_TIME))
                     
-                    # Check why deletion failed
-                    CURRENT_STATUS=$(aws cloudfront get-distribution --id "$dist_id" --query 'Distribution.Status' --output text 2>/dev/null || echo "Unknown")
-                    CURRENT_ENABLED=$(aws cloudfront get-distribution --id "$dist_id" --query 'Distribution.DistributionConfig.Enabled' --output text 2>/dev/null || echo "Unknown")
+                    # PHASE 2: DELETE distribution
+                    echo ""
+                    echo "   🗑️  Phase 2: Deleting distribution..."
+                    START_TIME=$(date +%s)
                     
-                    echo "      ⚠️  Immediate deletion failed (${DURATION}s)"
-                    echo "      📊 Current state - Status: $CURRENT_STATUS, Enabled: $CURRENT_ENABLED"
-                    echo "      💡 This is normal - distribution will be retried in Step 9"
+                    echo "      📥 Getting current ETag for deletion..."
+                    ETAG=$(aws cloudfront get-distribution --id "$dist_id" --query 'ETag' --output text)
                     
-                    # Only count as failure if it's still enabled and can't be deleted
-                    if [ "$CURRENT_ENABLED" = "true" ]; then
-                      FAILED_DISTRIBUTIONS+=("$dist_id:still_enabled")
+                    if [ -n "$ETAG" ]; then
+                      echo "      ✅ ETag obtained: $ETAG"
+                      echo "      🚀 Initiating deletion..."
+                      
+                      # Remove silent error suppression for deletion too
+                      DELETE_ERROR_FILE="/tmp/aws_delete_error_$dist_id.log"
+                      if aws cloudfront delete-distribution --id "$dist_id" --if-match "$ETAG" 2>&1 | tee "$DELETE_ERROR_FILE"; then
+                        END_TIME=$(date +%s)
+                        DURATION=$((END_TIME - START_TIME))
+                        echo "      ✅ Deletion initiated successfully (${DURATION}s)"
+                        TOTAL_DELETED=$((TOTAL_DELETED + 1))
+                      else
+                        END_TIME=$(date +%s)
+                        DURATION=$((END_TIME - START_TIME))
+                        
+                        # Check why deletion failed
+                        CURRENT_STATUS=$(aws cloudfront get-distribution --id "$dist_id" --query 'Distribution.Status' --output text || echo "Unknown")
+                        CURRENT_ENABLED=$(aws cloudfront get-distribution --id "$dist_id" --query 'Distribution.DistributionConfig.Enabled' --output text || echo "Unknown")
+                        
+                        echo "      ⚠️  Immediate deletion failed (${DURATION}s)"
+                        echo "      🔍 AWS CLI error:"
+                        cat "$DELETE_ERROR_FILE"
+                        echo "      📊 Current state - Status: $CURRENT_STATUS, Enabled: $CURRENT_ENABLED"
+                        echo "      💡 This is normal - distribution will be retried in Step 9"
+                        
+                        # Only count as failure if it's still enabled and can't be deleted
+                        if [ "$CURRENT_ENABLED" = "true" ]; then
+                          FAILED_DISTRIBUTIONS+=("$dist_id:still_enabled")
+                          TOTAL_FAILED=$((TOTAL_FAILED + 1))
+                        fi
+                      fi
+                      rm -f "$DELETE_ERROR_FILE"
+                    else
+                      echo "      ❌ Could not get ETag for distribution"
+                      FAILED_DISTRIBUTIONS+=("$dist_id:etag_failed")
                       TOTAL_FAILED=$((TOTAL_FAILED + 1))
                     fi
+                    
+                    echo "   ✅ Processing completed for $dist_id"
+                    echo ""
+                    
+                  else
+                    echo "⏭️  Skipping: $dist_id (comment doesn't match: $comment)"
                   fi
-                else
-                  echo "      ❌ Could not get ETag for distribution"
-                  FAILED_DISTRIBUTIONS+=("$dist_id:etag_failed")
-                  TOTAL_FAILED=$((TOTAL_FAILED + 1))
-                fi
+                done
                 
-                echo "   ✅ Processing completed for $dist_id"
+                echo "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
+                echo "📊 STEP 1 COMPLETION SUMMARY"
+                echo "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
+                echo "⏰ End time: $(date)"
+                echo ""
+                echo "📈 Progress Metrics:"
+                echo "   📋 Total Found:    $TOTAL_FOUND"
+                echo "   🔄 Total Disabled: $TOTAL_DISABLED"
+                echo "   🗑️  Total Deleted:  $TOTAL_DELETED"
+                echo "   ❌ Total Failed:    $TOTAL_FAILED"
                 echo ""
                 
-              else
-                echo "⏭️  Skipping: $dist_id (comment doesn't match: $comment)"
+                if [ $TOTAL_FAILED -gt 0 ]; then
+                  echo "⚠️  Failed Distributions:"
+                  for failed in "${FAILED_DISTRIBUTIONS[@]}"; do
+                    echo "   - $failed"
+                  done
+                  echo ""
+                  echo "💡 Failed distributions will be retried in Step 9"
+                fi
+                
+                if [ $TOTAL_DELETED -eq $TOTAL_FOUND ]; then
+                  echo "🎉 SUCCESS: All distributions processed successfully!"
+                elif [ $TOTAL_DELETED -gt 0 ]; then
+                  echo "✅ PARTIAL SUCCESS: Some distributions processed, others will be retried"
+                else
+                  echo "❌ NO DISTRIBUTIONS: Could not process any distributions"
+                fi
               fi
-            done
-            
-            echo "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
-            echo "📊 STEP 1 COMPLETION SUMMARY"
-            echo "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
-            echo "⏰ End time: $(date)"
-            echo ""
-            echo "📈 Progress Metrics:"
-            echo "   📋 Total Found:    $TOTAL_FOUND"
-            echo "   🔄 Total Disabled: $TOTAL_DISABLED"
-            echo "   🗑️  Total Deleted:  $TOTAL_DELETED"
-            echo "   ❌ Total Failed:    $TOTAL_FAILED"
-            echo ""
-            
-            if [ $TOTAL_FAILED -gt 0 ]; then
-              echo "⚠️  Failed Distributions:"
-              for failed in "${FAILED_DISTRIBUTIONS[@]}"; do
-                echo "   - $failed"
-              done
+              
               echo ""
-              echo "💡 Failed distributions will be retried in Step 9"
-            fi
-            
-            if [ $TOTAL_DELETED -eq $TOTAL_FOUND ]; then
-              echo "🎉 SUCCESS: All distributions processed successfully!"
-            elif [ $TOTAL_DELETED -gt 0 ]; then
-              echo "✅ PARTIAL SUCCESS: Some distributions processed, others will be retried"
-            else
-              echo "❌ NO DISTRIBUTIONS: Could not process any distributions"
-            fi
-          fi
-          
-          echo ""
-          echo "⏳ Waiting 60 seconds for operations to propagate..."
-          sleep 60
-          echo "✅ Step 1 completed - proceeding to next steps"
-
+              echo "⏳ Waiting 60 seconds for operations to propagate..."
+              sleep 60
+              echo "✅ Step 1 completed - proceeding to next steps"
 
       - name: "Step 2: Empty and Delete S3 Buckets"
         continue-on-error: true
