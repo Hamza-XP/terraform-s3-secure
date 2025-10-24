@@ -67,7 +67,8 @@ jobs:
       - name: Scan for Resources to Destroy
         id: scan
         run: |
-          PROJECT_NAME=$(grep -E '^project_name\s*=' terraform.tfvars | cut -d '"' -f2)
+          TF_DIR="${{ steps.detect.outputs.dir }}"
+          PROJECT_NAME=$(grep -E '^project_name\s*=' "$TF_DIR/terraform.tfvars"
           PREFIX="${PROJECT_NAME}-${{ github.event.inputs.environment }}"
           
           echo "prefix=$PREFIX" >> $GITHUB_OUTPUT
