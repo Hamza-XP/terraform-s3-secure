@@ -981,35 +981,46 @@ jobs:
           aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
           aws-region: ${{ env.AWS_REGION }}
 
-      - name: 🔧 Setup Terraform
-        uses: hashicorp/setup-terraform@v3
-        with:
-          terraform_version: ${{ env.TF_VERSION }}
-          terraform_wrapper: false
-
-      - name: 🔧 Terraform Init
-        working-directory: ${{ needs.setup.outputs.tf_dir }}
-        run: terraform init
-
       - name: 📊 Enhanced Deployment Verification
-        working-directory: ${{ needs.setup.outputs.tf_dir }}
         run: |
           echo "## 📊 Deployment Verification" >> $GITHUB_STEP_SUMMARY
           echo "" >> $GITHUB_STEP_SUMMARY
           
-          # FIXED: Capture outputs properly without wrapper
-          DIST=$(terraform output -raw cloudfront_distribution_id 2>/dev/null || echo "")
-          DOMAIN=$(terraform output -raw cloudfront_domain_name 2>/dev/null || echo "")
-          BUCKET=$(terraform output -raw s3_bucket_name 2>/dev/null || echo "")
-          WAF=$(terraform output -raw waf_web_acl_arn 2>/dev/null || echo "")
-          DASHBOARD=$(terraform output -raw dashboard_url 2>/dev/null || echo "")
+          # Get project details
+          PROJECT="secure-website"
+          ENV="production"
+          PREFIX="${PROJECT}-${ENV}"
+          
+          # FIXED: Query AWS directly instead of using Terraform outputs
+          echo "🔍 Querying AWS resources directly..."
+          
+          # Get CloudFront distribution
+          DIST=$(aws cloudfront list-distributions --output json 2>/dev/null | \
+            jq -r ".DistributionList.Items[]? | select(.Comment==\"${PREFIX} distribution\") | .Id" | head -1)
+          DOMAIN=$(aws cloudfront list-distributions --output json 2>/dev/null | \
+            jq -r ".DistributionList.Items[]? | select(.Comment==\"${PREFIX} distribution\") | .DomainName" | head -1)
+          
+          # Get S3 bucket
+          BUCKET=$(aws s3api list-buckets --output json 2>/dev/null | \
+            jq -r ".Buckets[]? | select(.Name==\"${PREFIX}-website\") | .Name" | head -1)
+          
+          # Get WAF
+          WAF=$(aws wafv2 list-web-acls --scope CLOUDFRONT --region us-east-1 --output json 2>/dev/null | \
+            jq -r ".WebACLs[]? | select(.Name==\"${PREFIX}-waf\") | .Name" | head -1)
+          
+          # Get CloudWatch dashboard URL
+          DASHBOARD_NAME="${PREFIX}-dashboard"
+          if aws cloudwatch get-dashboard --dashboard-name "$DASHBOARD_NAME" --region us-east-1 &>/dev/null; then
+            DASHBOARD="https://console.aws.amazon.com/cloudwatch/home?region=us-east-1#dashboards:name=${DASHBOARD_NAME}"
+          else
+            DASHBOARD=""
+          fi
           
           # Set defaults if empty
           DIST="${DIST:-N/A}"
           DOMAIN="${DOMAIN:-N/A}"
           BUCKET="${BUCKET:-N/A}"
           WAF="${WAF:-N/A}"
-          DASHBOARD="${DASHBOARD:-N/A}"
           
           echo "### ✅ Resources Status" >> $GITHUB_STEP_SUMMARY
           echo "" >> $GITHUB_STEP_SUMMARY
@@ -1100,4 +1111,3 @@ jobs:
           echo "- 🔄 Existing resources imported and reused" >> $GITHUB_STEP_SUMMARY
           echo "- ✅ Same CloudFront URL on every deployment" >> $GITHUB_STEP_SUMMARY
           echo "- 💰 No duplicate resources wasting costs" >> $GITHUB_STEP_SUMMARY
-     
