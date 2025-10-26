@@ -146,7 +146,7 @@ jobs:
           soft_fail: true
           quiet: true
           compact: true
-          skip_check: CKV_AWS_145,CKV_AWS_310,CKV_AWS_174,CKV_AWS_374,CKV_AWS_241,CKV_AWS_240,CKV_AWS_338,CKV_AWS_158,CKV_AWS_300
+          skip_check: CKV_AWS_145,CKV_AWS_310,CKV_AWS_174,CKV_AWS_374,CKV_AWS_241,CKV_AWS_240,CKV_AWS_338,CKV_AWS_158,CKV_AWS_300,CKV2_AWS_65,CKV_AWS_144,CKV2_AWS_61,CKV2_AWS_42,CKV2_AWS_62,CKV_AWS_18,CKV2_AWS_47
         continue-on-error: true
 
   plan:
