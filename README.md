@@ -10,7 +10,38 @@
 ## Secure Static Website Infrastructure on AWS
 This Terraform project automates the deployment of a static website on AWS using industry best practices. It integrates S3 for storage, CloudFront for global content delivery, and AWS WAF with advanced threat protection to defend against OWASP Top 10 vulnerabilities. Designed for zero-downtime deployments, the infrastructure includes automated CI/CD, real-time monitoring, and cost-optimized scaling—all managed as code.
 
+![Live deployment Screenshot](utils/website-ss.png)
+
 ## 🏗️ Architecture Overview
+
+```mermaid
+graph LR
+
+  %% ============= USER ENTRY =============
+  U[👤 User] --> R53[📡 Route 53<br/>DNS & Domain Routing]
+
+  %% ============= DISTRIBUTION =============
+  R53 --> CF[🌍 CloudFront CDN<br/>Global Distribution + Caching]
+  CF --> ACM[🔐 ACM SSL Certificate<br/>TLS/SSL + Auto Renewal]
+  CF --> HEADERS[📋 Security Headers<br/>HSTS, X-Frame, Content-Type]
+
+  %% ============= SECURITY LAYER =============
+  CF --> WAF[🧱 AWS WAF<br/>Rate Limiting + Managed Rules + Geo Restriction]
+  WAF --> OAC[🚫 Origin Access Control<br/>Restrict Direct S3 Access]
+
+  %% ============= STORAGE BACKEND =============
+  OAC --> S3[(🪣 S3 Bucket<br/>Static Website + Versioning + Encryption)]
+  ENC[🔑 S3 Encryption<br/>SSE-S3 / KMS] --> S3
+
+  %% ============= MONITORING & LOGGING =============
+  CF --> LOGS[(🗂️ Access Logs<br/>Stored in S3)]
+  LOGS --> LIFE[🕒 Log Lifecycle<br/>Retention + Cleanup]
+
+  CF --> CW[📈 CloudWatch Dashboard<br/>Metrics + Visualization]
+  CW --> ALARM[🚨 CloudWatch Alarms<br/>4xx/5xx Error Detection]
+  ALARM --> SNS[📩 SNS Notifications<br/>Critical Alerts]
+  ```
+---
 
 This project creates a robust, scalable infrastructure with the following components:
 
@@ -36,6 +67,28 @@ This project creates a robust, scalable infrastructure with the following compon
 - **SNS Notifications** - Alert system for critical issues
 - **Access Logs** - CloudFront request logging to S3
 - **Log Lifecycle** - Automatic log retention and cleanup
+
+## 🔄 CI/CD Integration Deep Dive
+
+![Live ci/cd Screenshot](utils/workflow-ss.png)
+
+## 🧩 Detailed CI/CD Stage Breakdown
+
+| **CI File** | **Stage** | **Purpose** | **Tools** | **Triggers** |
+|--------------|------------|--------------|-------------|---------------|
+| **Deploy Infrastructure** | **Setup** | 🔍 Detect project structure, initialize environment variables, and prepare Terraform backend configuration | GitHub Actions, Terraform | Manual Dispatch |
+| **Deploy Infrastructure** | **Validate** | ✅ Run `terraform validate` to ensure syntax and configuration integrity before deployment | Terraform CLI | Manual Dispatch |
+| **Deploy Infrastructure** | **Security Scan** | 🔒 Perform security checks on Terraform configurations and AWS policies (e.g., missing encryption, public buckets) | tfsec, checkov, AWS CLI | Manual Dispatch |
+| **Deploy Infrastructure** | **Plan** | 📋 Generate a detailed Terraform plan to preview infrastructure changes and detect drift | AWS CLI, Terraform | Manual Dispatch |
+| **Deploy Infrastructure** | **Apply** | 🚀 Apply Terraform configurations to provision or update AWS resources including S3, CloudFront, and WAF | GitHub Actions, Terraform, AWS CLI, jq | Manual Dispatch |
+| **Deploy Infrastructure** | **Post-Deploy Checks** | 📊 Verify deployment success, validate outputs, and log CloudFront distribution details | AWS CLI, jq | Manual Dispatch |
+| **Destroy Infrastructure** | **Setup** | ⚙️ Initialize Terraform backend and environment for teardown | Terraform, AWS CLI | Manual Dispatch |
+| **Destroy Infrastructure** | **Resource Discovery** | 🔍 Identify all related CloudFront, S3, and WAF resources for safe deletion | AWS CLI, jq | Manual Dispatch |
+| **Destroy Infrastructure** | **Disable Distributions** | ⛔ Disable CloudFront distributions to allow deletion | AWS CLI | Manual Dispatch |
+| **Destroy Infrastructure** | **Delete Resources** | 💣 Execute Terraform destroy or AWS CLI commands to remove infrastructure components | Terraform, AWS CLI | Manual Dispatch |
+| **Destroy Infrastructure** | **Cleanup & Logging** | 🧹 Clean up orphaned resources, remove logs, and summarize results in GitHub Actions output | AWS CLI, jq | Manual Dispatch |
+
+---
 
 ## 📁 Project Structure
 
@@ -63,74 +116,6 @@ terraform-s3-secure
 ├── .gitignore                          # Git ignore rules
 ├── .pre-commit-config.yaml             # Pre-commit hooks configuration
 └── Makefile                            # Static assets
-```
-
-## 🛠️ Prerequisites
-
-Before deploying, ensure you have:
-
-1. **AWS CLI** installed and configured
-   ```bash
-   aws configure
-   ```
-
-2. **Terraform** installed (version >= 1.0)
-   ```bash
-   terraform --version
-   ```
-
-3. **Domain name** (optional but recommended)
-   - For SSL certificate validation
-   - For custom domain setup
-
-4. **AWS Permissions** - Your AWS user/role needs permissions for:
-   - S3 (buckets, objects, policies)
-   - CloudFront (distributions, OAC)
-   - ACM (certificates)
-   - WAF (web ACLs)
-   - CloudWatch (alarms, dashboards)
-   - SNS (topics)
-
-## 🚀 Quick Start
-
-### 1. Clone and Configure
-
-```bash
-# Clone the repository
-git clone <your-repo-url>
-cd terraform-secure-website
-
-# Copy example variables
-cp terraform.tfvars.example terraform.tfvars
-
-# Edit variables with your settings
-nano terraform.tfvars
-```
-
-### 2. Deploy Infrastructure
-
-Option A: **Automated Deployment** (Recommended)
-```bash
-chmod +x deploy.sh
-./deploy.sh
-```
-
-Option B: **Manual Deployment**
-```bash
-# Initialize Terraform
-terraform init
-
-# Review the plan
-terraform plan
-
-# Apply changes
-terraform apply
-
-# Upload website files
-aws s3 sync . s3://$(terraform output -raw s3_bucket_name) --exclude="*" --include="*.html" --include="*.png"
-
-# Invalidate CloudFront cache
-aws cloudfront create-invalidation --distribution-id $(terraform output -raw cloudfront_distribution_id) --paths "/*"
 ```
 
 ## ⚙️ Configuration Options
@@ -275,45 +260,6 @@ For a typical small website (1GB transfer, 100K requests):
    # Check WAF logs in CloudWatch
    aws logs describe-log-groups --log-group-name-prefix "aws-waf-logs"
    ```
-
-## 🔄 CI/CD Integration
-
-### GitHub Actions Example
-
-```yaml
-name: Deploy Infrastructure
-
-on:
-  push:
-    branches: [main]
-
-jobs:
-  deploy:
-    runs-on: ubuntu-latest
-    steps:
-      - uses: actions/checkout@v3
-      
-      - name: Setup Terraform
-        uses: hashicorp/setup-terraform@v2
-        
-      - name: Configure AWS
-        uses: aws-actions/configure-aws-credentials@v2
-        with:
-          aws-access-key-id: ${{ secrets.AWS_ACCESS_KEY_ID }}
-          aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
-          aws-region: us-east-1
-          
-      - name: Deploy Infrastructure
-        run: |
-          terraform init
-          terraform plan
-          terraform apply -auto-approve
-          
-      - name: Upload Website
-        run: |
-          aws s3 sync . s3://$(terraform output -raw s3_bucket_name) \
-            --exclude="*" --include="*.html" --include="*.png"
-```
 
 ## 📝 Customization Guide
 
